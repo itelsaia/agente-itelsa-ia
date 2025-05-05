@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "itelsa-chatbot-457800",
+  "private_key_id": "5e24805be5c74c038355e3d9b337bee4adc81b2c",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCxDTPk7uw8B1jH\n6J6PA6Sxu3+9lMeYBPLnObQFoMMWN13tvAPcHsI186EaTDBfy+0LQvPcVXR4fTQ6\n4Z2ocf5pIiJM7vSAQqXJLIslO+Sfm/P1CDlgndp+5xZ3z3i5wSriLJavIeA6CHHF\nh3mv7Birp5gwOe/w1j7pz4k+KfdjJz83QcuEIZXpdKRumG99HVMiBmJ48RgyitNK\nvvgdiPdQnmmRxJPFOqzh4xm22N6WbEW+0um5yczyX0YZbRjjgRWsLi+V6sc3yHbC\nTHyJFnPzh9RHtaupBmavKNactWSxjyEn+tSTpvoZQiiATWNr5ZWCRjFBbDN16Jq2\nkZAXknwlAgMBAAECggEACEzuqGZ9I8lSY7jnqhvJHl4EfJ5bhyiAPM/rPTJOwx1g\nZXNhmPHGOCJOZL26rNsSJ2uBpExLVBTGnJYUPp/thf9ILWQsiVDWleplMZ8vtj3o\n/41dp0ZvRnDOEFrlNYw1VvoxLE/Bw+a+crzJuzIt6+pFC8nDkn5w36RPsl7kTr0l\no53zYlhoqSXmonCVrJrK04O+4pDVMHW4K66uRo4ewToNMC1wrMDbV1C42jIX+cr7\n0ZP2NUl3mdatnnH/uJ1yrINqxzy0f1I3PiZjKaKPZELDykUpIMSmKGps2rnKYDLp\ndcia2REIsbaggGjkYXIkGIIXM7FXatkUkpp4TmXz4QKBgQD1NBylBt1KZE7XgW6H\nmnZ99/J6HoYrWH/OOmYaROCpjd8N9YX0i/XzcMWUlB72fwTi+zy1oJbKrovLEn0H\nSHKWjcw3c1t7ZxNdYu+2SE1MAszqwwhQKDfoOwZOlOJH8EozNN1RxqV+Etwnv1ao\n58/+u6zuMux1FG5H9VyXyDP8tQKBgQC42OT+eJ48+d+fJ81z+Maf+xRVJJMwZlHJ\n/5IRsXbT4GzrhrIdj+Bw8Hbd1h5AQNExTv++7hu69ZtzmfIYov/kOv7WC1tI+u7K\n8ClMZWLg94H1eMQ8uPDpQ6LHl0oK95Hcr6maKGAyhC8+cvGUiR+VeM3cYhCrU5BI\n3bLfqIqXsQKBgC2/KjTzwed2LWtxf3CXNdIspzV3amq92SJdrNzrysp3aI0PKI3G\nav2fJY2h0OEGM6AxZVMxgdCQng4mBeOM9av3Comx4Ph185vxsG1eseUjhJ2sA2oJ\nBt0x3exdRJZNU1qYW049dHTACgj0XrOmhByvYQUTxR/Wzvhn432B4YkdAoGBAIt8\nMCDOiCnfLJ3+/QxcWBX083zkYqWNMH7LekAbuF1d5xM7y0B/h4/yBOCVaLJ3tuQM\nhvRe3VIRcEKlkoiAx7RDyHVgkHvbz0IYRDG/+ANnAgxoGzzvGewL+9O9GER6WPk9\nHTCU8zJriPMI7b92Uf0K8d0xqv59yk0R7p7TofGhAoGBAImwlr82c7KjLzZCZItb\nRwD4ewpSOtd4onIOqeZNKrZuWV/bO/MCjfKMR34ISc0iCOdxf8uzkSweaziWehca\n2Td8nXMO4lbtCs9t1kjlPG0Q/0Iu2EZ0KDNKX/IgRcwWMAy/xfdkS9OY7IBKy2vX\nDklf6+BxHirH6jrVlHNw2A6e\n-----END PRIVATE KEY-----\n",
+  "client_email": "itelsa-chatbot@itelsa-chatbot-457800.iam.gserviceaccount.com",
+  "client_id": "105596722046990867098",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/itelsa-chatbot%40itelsa-chatbot-457800.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
