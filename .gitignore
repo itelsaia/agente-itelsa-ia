@@ -1,0 +1,7 @@
+# Archivos sensibles y temporales que NO deben subirse
+.env
+*.json
+__pycache__/
+*.pyc
+.DS_Store
+*.log
