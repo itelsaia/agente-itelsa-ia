@@ -20,7 +20,10 @@ requests==2.31.0
 
 # Web scraping (para extraer contenido web)
 beautifulsoup4==4.12.2
-lxml==4.9.3
+#lxml==4.9.3
+# lxml==4.9.3  ← COMENTADO PARA EVITAR ERRORES EN HEROKU
+html5lib==1.1
+
 
 # Logging y utilidades
 python-dateutil==2.8.2
