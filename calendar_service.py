@@ -1,112 +1,164 @@
+# calendar_service.py - Versión Producción
 import os
 import datetime
-import re
+import logging
 from dotenv import load_dotenv
-import gspread
 from google.oauth2.service_account import Credentials
-# REMOVED: from registro_agendamiento import registrar_agendamiento_completo
+from googleapiclient.discovery import build
+
+# Configurar logging
+logger = logging.getLogger(__name__)
 
 # Cargar variables de entorno
 load_dotenv()
 
-# Obtener credenciales desde variables de entorno
+# CONFIGURACIÓN - PERSONALIZAR AQUÍ
 CREDS_FILE = os.getenv("CREDS_FILE")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 
-# Definir el alcance de la API
-SCOPE = ["https://www.googleapis.com/auth/calendar"]
-credentials = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPE)
+# CONFIGURACIÓN DE HORARIOS - PERSONALIZAR SEGÚN TU NEGOCIO
+HORARIO_INICIO = 8  # 8 AM
+HORARIO_FIN = 17    # 5 PM (última cita a las 4 PM)
+DURACION_CITA = 1   # 1 hora por cita
+DIAS_LABORABLES = [0, 1, 2, 3, 4]  # Lunes a Viernes (0=Lunes, 6=Domingo)
 
-# Construir el servicio de Google Calendar
-from googleapiclient.discovery import build
-service = build("calendar", "v3", credentials=credentials)
+if not CREDS_FILE or not GOOGLE_CALENDAR_ID:
+    raise ValueError("❌ CREDS_FILE y GOOGLE_CALENDAR_ID deben estar configurados en .env")
 
+# Configurar servicios de Google
+try:
+    SCOPE = ["https://www.googleapis.com/auth/calendar"]
+    credentials = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPE)
+    service = build("calendar", "v3", credentials=credentials)
+    logger.info("✅ Conexión con Google Calendar establecida")
+except Exception as e:
+    logger.error(f"❌ Error conectando con Google Calendar: {str(e)}")
+    raise
 
 def convertir_hora_a_24h(hora_texto):
     """
-    Convierte hora en formato 12h (con am/pm) a formato 24h silenciosamente.
+    Convierte hora en formato 12h (con am/pm) a formato 24h.
+    
+    Args:
+        hora_texto (str): Hora en formato como "2pm", "10:30am", etc.
+    
+    Returns:
+        str: Hora en formato 24h (HH:MM)
     """
-    hora_texto = hora_texto.strip().lower()
-    
-    es_pm = False
-    if 'pm' in hora_texto:
-        es_pm = True
-        hora_texto = hora_texto.replace('pm', '').strip()
-    elif 'am' in hora_texto:
-        hora_texto = hora_texto.replace('am', '').strip()
-    else:
-        if ':' in hora_texto:
-            return hora_texto
+    try:
+        hora_texto = hora_texto.strip().lower()
+        
+        # Detectar AM/PM
+        es_pm = 'pm' in hora_texto
+        hora_limpia = hora_texto.replace('pm', '').replace('am', '').strip()
+        
+        # Procesar hora
+        if ':' in hora_limpia:
+            partes = hora_limpia.split(':')
+            hora_num = int(partes[0])
+            minutos = partes[1]
         else:
-            return f"{hora_texto}:00"
-    
-    if ':' in hora_texto:
-        partes = hora_texto.split(':')
-        hora_num = int(partes[0])
-        minutos = partes[1]
-    else:
-        hora_num = int(hora_texto)
-        minutos = "00"
-    
-    if es_pm and hora_num != 12:
-        hora_num += 12
-    elif not es_pm and hora_num == 12:
-        hora_num = 0
-    
-    return f"{hora_num:02d}:{minutos}"
-
+            hora_num = int(hora_limpia)
+            minutos = "00"
+        
+        # Convertir a 24h
+        if es_pm and hora_num != 12:
+            hora_num += 12
+        elif not es_pm and hora_num == 12:
+            hora_num = 0
+        
+        return f"{hora_num:02d}:{minutos}"
+        
+    except Exception as e:
+        logger.error(f"❌ Error convertiendo hora '{hora_texto}': {str(e)}")
+        return None
 
 def generar_horarios_disponibles(fecha):
     """
     Genera lista de horarios disponibles para una fecha específica.
     
+    Args:
+        fecha (str): Fecha en formato YYYY-MM-DD
+    
     Returns:
         list: Lista de horarios disponibles en formato amigable
     """
-    horarios_sugeridos = []
+    horarios_disponibles = []
     
-    # Horarios laborales: 8am a 4pm (última cita a las 4pm)
-    horarios_base = ["8:00am", "9:00am", "10:00am", "11:00am", "12:00pm", "1:00pm", "2:00pm", "3:00pm", "4:00pm"]
-    
-    for hora_amigable in horarios_base:
-        hora_24h = convertir_hora_a_24h(hora_amigable)
+    try:
+        # PERSONALIZAR: Ajustar horarios según tu negocio
+        horarios_base = [
+            "8:00am", "9:00am", "10:00am", "11:00am", 
+            "12:00pm", "1:00pm", "2:00pm", "3:00pm", "4:00pm"
+        ]
         
-        try:
+        for hora_amigable in horarios_base:
+            hora_24h = convertir_hora_a_24h(hora_amigable)
+            if not hora_24h:
+                continue
+            
             # Verificar disponibilidad en calendario
-            start_datetime = datetime.datetime.strptime(f"{fecha}T{hora_24h}:00", "%Y-%m-%dT%H:%M:%S")
-            end_datetime = start_datetime + datetime.timedelta(hours=1)
-            
-            eventos = service.events().list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMin=start_datetime.isoformat() + "-05:00",
-                timeMax=end_datetime.isoformat() + "-05:00",
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute()
-            
-            # Si no hay eventos, el horario está disponible
-            if len(eventos.get("items", [])) == 0:
-                horarios_sugeridos.append(hora_amigable)
-        except:
-            continue
-    
-    return horarios_sugeridos
+            if verificar_horario_libre(fecha, hora_24h):
+                horarios_disponibles.append(hora_amigable)
+        
+        logger.info(f"📅 {len(horarios_disponibles)} horarios disponibles para {fecha}")
+        return horarios_disponibles
+        
+    except Exception as e:
+        logger.error(f"❌ Error generando horarios para {fecha}: {str(e)}")
+        return []
 
+def verificar_horario_libre(fecha, hora_24h):
+    """
+    Verifica si un horario específico está libre en el calendario.
+    
+    Args:
+        fecha (str): Fecha en formato YYYY-MM-DD
+        hora_24h (str): Hora en formato HH:MM
+    
+    Returns:
+        bool: True si está libre, False si está ocupado
+    """
+    try:
+        # Crear ventana de tiempo
+        start_datetime = datetime.datetime.strptime(f"{fecha}T{hora_24h}:00", "%Y-%m-%dT%H:%M:%S")
+        end_datetime = start_datetime + datetime.timedelta(hours=DURACION_CITA)
+        
+        # Consultar eventos existentes
+        eventos = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=start_datetime.isoformat() + "-05:00",  # PERSONALIZAR: Ajustar timezone
+            timeMax=end_datetime.isoformat() + "-05:00",
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        
+        # Si no hay eventos, está libre
+        eventos_encontrados = len(eventos.get("items", []))
+        esta_libre = eventos_encontrados == 0
+        
+        if not esta_libre:
+            logger.info(f"⏰ Horario ocupado: {fecha} {hora_24h}")
+        
+        return esta_libre
+        
+    except Exception as e:
+        logger.error(f"❌ Error verificando horario {fecha} {hora_24h}: {str(e)}")
+        return False
 
 def verificar_disponibilidad(fecha, hora):
     """
-    Verifica disponibilidad silenciosamente sin mostrar mensajes de debug.
+    Verifica disponibilidad completa de una fecha y hora solicitada.
+    
+    Args:
+        fecha (str): Fecha en formato YYYY-MM-DD
+        hora (str): Hora en formato amigable (ej: "2pm", "10:30am")
     
     Returns:
-        dict: {
-            'disponible': bool,
-            'motivo': str,
-            'horarios_alternativos': list
-        }
+        dict: Resultado de la verificación con motivo y alternativas
     """
     try:
-        # Convertir la hora a formato 24h
+        # Convertir hora a formato 24h
         hora_24h = convertir_hora_a_24h(hora)
         if not hora_24h:
             return {
@@ -117,12 +169,12 @@ def verificar_disponibilidad(fecha, hora):
         
         # Verificar horario laboral
         hora_num = int(hora_24h.split(':')[0])
-        if hora_num < 8 or hora_num >= 17:
+        if hora_num < HORARIO_INICIO or hora_num >= HORARIO_FIN:
             horarios_disponibles = generar_horarios_disponibles(fecha)
             return {
                 'disponible': False,
                 'motivo': 'fuera_horario_laboral',
-                'horarios_alternativos': horarios_disponibles[:4]  # Solo los primeros 4
+                'horarios_alternativos': horarios_disponibles[:4]
             }
         
         # Verificar formato de fecha
@@ -136,22 +188,178 @@ def verificar_disponibilidad(fecha, hora):
             }
         
         # Verificar día laborable
-        if fecha_obj.weekday() >= 5:  # 5=sábado, 6=domingo
-            # Sugerir el próximo lunes
-            dias_hasta_lunes = 7 - fecha_obj.weekday()
-            siguiente_lunes = fecha_obj + datetime.timedelta(days=dias_hasta_lunes)
-            horarios_disponibles = generar_horarios_disponibles(siguiente_lunes.strftime("%Y-%m-%d"))
+        if fecha_obj.weekday() not in DIAS_LABORABLES:
+            # Calcular próximo día laborable
+            dias_hasta_laborable = 1
+            siguiente_dia = fecha_obj + datetime.timedelta(days=dias_hasta_laborable)
+            while siguiente_dia.weekday() not in DIAS_LABORABLES:
+                dias_hasta_laborable += 1
+                siguiente_dia = fecha_obj + datetime.timedelta(days=dias_hasta_laborable)
+            
+            horarios_disponibles = generar_horarios_disponibles(siguiente_dia.strftime("%Y-%m-%d"))
             return {
                 'disponible': False,
                 'motivo': 'fin_semana',
-                'fecha_alternativa': siguiente_lunes.strftime("%Y-%m-%d"),
+                'fecha_alternativa': siguiente_dia.strftime("%Y-%m-%d"),
                 'horarios_alternativos': horarios_disponibles[:4]
             }
         
-        # Verificar conflictos en calendario
-        start_datetime = datetime.datetime.strptime(f"{fecha}T{hora_24h}:00", "%Y-%m-%dT%H:%M:%S")
-        end_datetime = start_datetime + datetime.timedelta(hours=1)
+        # Verificar si el horario está libre
+        if not verificar_horario_libre(fecha, hora_24h):
+            horarios_disponibles = generar_horarios_disponibles(fecha)
+            return {
+                'disponible': False,
+                'motivo': 'horario_ocupado',
+                'horarios_alternativos': horarios_disponibles[:4]
+            }
         
+        # Todo correcto, horario disponible
+        return {
+            'disponible': True,
+            'motivo': 'disponible',
+            'horarios_alternativos': []
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error verificando disponibilidad {fecha} {hora}: {str(e)}")
+        return {
+            'disponible': False,
+            'motivo': 'error_sistema',
+            'horarios_alternativos': []
+        }
+
+def agendar_en_calendar(nombre, correo, telefono, fecha, hora):
+    """
+    Agenda una cita en Google Calendar si está disponible.
+    
+    Args:
+        nombre (str): Nombre del cliente
+        correo (str): Correo del cliente
+        telefono (str): Teléfono del cliente
+        fecha (str): Fecha en formato YYYY-MM-DD
+        hora (str): Hora en formato amigable
+    
+    Returns:
+        dict: Resultado del agendamiento
+    """
+    try:
+        # Verificar disponibilidad primero
+        resultado = verificar_disponibilidad(fecha, hora)
+        
+        if not resultado['disponible']:
+            logger.info(f"📅 Agendamiento rechazado para {nombre}: {resultado['motivo']}")
+            return resultado
+        
+        # Proceder con el agendamiento
+        hora_24h = convertir_hora_a_24h(hora)
+        hora_num = int(hora_24h.split(':')[0])
+        minutos = hora_24h.split(':')[1]
+        
+        # Crear fechas de inicio y fin
+        fecha_inicio = f"{fecha}T{hora_24h}:00"
+        fecha_fin = f"{fecha}T{hora_num + DURACION_CITA:02d}:{minutos}:00"
+        
+        # PERSONALIZAR: Ajustar título y descripción del evento
+        evento = {
+            'summary': f"Asesoría - {nombre}",  # CAMBIAR: Personalizar título
+            'description': (
+                f"Cliente: {nombre}\n"
+                f"Correo: {correo}\n"
+                f"Teléfono: {telefono}\n"
+                f"Tipo: Asesoría gratuita"  # CAMBIAR: Personalizar descripción
+            ),
+            'start': {
+                'dateTime': fecha_inicio,
+                'timeZone': 'America/Bogota',  # PERSONALIZAR: Tu timezone
+            },
+            'end': {
+                'dateTime': fecha_fin,
+                'timeZone': 'America/Bogota',  # PERSONALIZAR: Tu timezone
+            },
+            'attendees': [
+                {'email': correo}
+            ],
+            'reminders': {
+                'useDefault': False,
+                'overrides': [
+                    {'method': 'email', 'minutes': 24 * 60},  # 1 día antes
+                    {'method': 'popup', 'minutes': 60},       # 1 hora antes
+                ],
+            },
+        }
+        
+        # Crear el evento en el calendario
+        evento_creado = service.events().insert(
+            calendarId=GOOGLE_CALENDAR_ID, 
+            body=evento,
+            sendUpdates='all'  # Enviar invitaciones por email
+        ).execute()
+        
+        logger.info(f"✅ Cita agendada exitosamente para {nombre} - {fecha} {hora}")
+        
+        return {
+            'disponible': True,
+            'motivo': 'agendado_exitosamente',
+            'evento_id': evento_creado.get('id'),
+            'horarios_alternativos': []
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error agendando cita para {nombre}: {str(e)}")
+        return {
+            'disponible': False,
+            'motivo': 'error_agendamiento',
+            'horarios_alternativos': []
+        }
+
+def formatear_fecha_amigable(fecha_str):
+    """
+    Convierte fecha YYYY-MM-DD a formato amigable en español.
+    
+    Args:
+        fecha_str (str): Fecha en formato YYYY-MM-DD
+    
+    Returns:
+        str: Fecha en formato amigable
+    """
+    try:
+        fecha_obj = datetime.datetime.strptime(fecha_str, "%Y-%m-%d")
+        
+        # PERSONALIZAR: Ajustar idioma según tu región
+        dias_semana = [
+            'lunes', 'martes', 'miércoles', 'jueves', 
+            'viernes', 'sábado', 'domingo'
+        ]
+        meses = [
+            'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+            'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+        ]
+        
+        dia_semana = dias_semana[fecha_obj.weekday()]
+        mes = meses[fecha_obj.month - 1]
+        
+        return f"{dia_semana} {fecha_obj.day} de {mes}"
+        
+    except Exception as e:
+        logger.error(f"❌ Error formateando fecha '{fecha_str}': {str(e)}")
+        return fecha_str
+
+def obtener_citas_del_dia(fecha):
+    """
+    Obtiene todas las citas agendadas para un día específico.
+    
+    Args:
+        fecha (str): Fecha en formato YYYY-MM-DD
+    
+    Returns:
+        list: Lista de eventos del día
+    """
+    try:
+        # Definir ventana del día completo
+        start_datetime = datetime.datetime.strptime(f"{fecha}T00:00:00", "%Y-%m-%dT%H:%M:%S")
+        end_datetime = start_datetime + datetime.timedelta(days=1)
+        
+        # Consultar eventos
         eventos = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
             timeMin=start_datetime.isoformat() + "-05:00",
@@ -160,98 +368,187 @@ def verificar_disponibilidad(fecha, hora):
             orderBy="startTime"
         ).execute()
         
-        if len(eventos.get("items", [])) > 0:
-            horarios_disponibles = generar_horarios_disponibles(fecha)
-            return {
-                'disponible': False,
-                'motivo': 'horario_ocupado',
-                'horarios_alternativos': horarios_disponibles[:4]
-            }
+        citas = []
+        for evento in eventos.get('items', []):
+            try:
+                cita_info = {
+                    'id': evento.get('id'),
+                    'titulo': evento.get('summary', 'Sin título'),
+                    'descripcion': evento.get('description', ''),
+                    'inicio': evento.get('start', {}).get('dateTime', ''),
+                    'fin': evento.get('end', {}).get('dateTime', ''),
+                    'asistentes': [att.get('email', '') for att in evento.get('attendees', [])]
+                }
+                citas.append(cita_info)
+            except:
+                continue
         
-        # Todo OK, horario disponible
-        return {
-            'disponible': True,
-            'motivo': 'disponible',
-            'horarios_alternativos': []
-        }
+        logger.info(f"📅 {len(citas)} citas encontradas para {fecha}")
+        return citas
         
     except Exception as e:
-        return {
-            'disponible': False,
-            'motivo': 'error_sistema',
-            'horarios_alternativos': []
-        }
+        logger.error(f"❌ Error obteniendo citas del día {fecha}: {str(e)}")
+        return []
 
-
-def agendar_en_calendar(nombre, correo, telefono, fecha, hora):
+def cancelar_cita(evento_id, motivo="Cancelada por el usuario"):
     """
-    Agenda una cita solo si está disponible, sin mostrar mensajes técnicos.
-    CORREGIDO: Ya NO registra en Google Sheets aquí (se evita duplicación).
+    Cancela una cita específica en el calendario.
+    
+    Args:
+        evento_id (str): ID del evento a cancelar
+        motivo (str): Motivo de la cancelación
     
     Returns:
-        dict: Resultado del agendamiento con información para mostrar al usuario
+        bool: True si se canceló exitosamente
     """
-    # Verificar disponibilidad silenciosamente
-    resultado = verificar_disponibilidad(fecha, hora)
-    
-    if not resultado['disponible']:
-        return resultado
-    
     try:
-        # Convertir hora y crear evento
-        hora_24h = convertir_hora_a_24h(hora)
-        hora_num = int(hora_24h.split(':')[0])
-        minutos = hora_24h.split(':')[1]
+        # Obtener el evento
+        evento = service.events().get(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=evento_id
+        ).execute()
         
-        fecha_inicio = f"{fecha}T{hora_24h}:00"
-        fecha_fin = f"{fecha}T{hora_num + 1:02d}:{minutos}:00"
+        # Actualizar el evento para marcarlo como cancelado
+        evento['summary'] = f"[CANCELADA] {evento.get('summary', '')}"
+        evento['description'] = f"{evento.get('description', '')}\n\nCANCELADA: {motivo}"
+        evento['status'] = 'cancelled'
         
-        evento = {
-            'summary': f"Asesoría gratuita - {nombre}",
-            'description': f"Correo: {correo}\nTeléfono: {telefono}",
-            'start': {
-                'dateTime': fecha_inicio,
-                'timeZone': 'America/Bogota',
-            },
-            'end': {
-                'dateTime': fecha_fin,
-                'timeZone': 'America/Bogota',
-            },
-        }
+        # Actualizar en el calendario
+        service.events().update(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=evento_id,
+            body=evento,
+            sendUpdates='all'
+        ).execute()
         
-        # Solo crear evento en calendario
-        service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=evento).execute()
-        
-        # REMOVED: El registro en Google Sheets se hace desde app.py
-        # para evitar duplicación
-        
-        return {
-            'disponible': True,
-            'motivo': 'agendado_exitosamente',
-            'horarios_alternativos': []
-        }
+        logger.info(f"✅ Cita cancelada exitosamente: {evento_id}")
+        return True
         
     except Exception as e:
-        return {
-            'disponible': False,
-            'motivo': 'error_agendamiento',
-            'horarios_alternativos': []
-        }
+        logger.error(f"❌ Error cancelando cita {evento_id}: {str(e)}")
+        return False
 
-
-def formatear_fecha_amigable(fecha_str):
+def obtener_estadisticas_calendario(dias=7):
     """
-    Convierte fecha YYYY-MM-DD a formato amigable.
+    Obtiene estadísticas del calendario para los próximos N días.
+    
+    Args:
+        dias (int): Número de días a analizar
+    
+    Returns:
+        dict: Estadísticas del calendario
     """
     try:
-        fecha_obj = datetime.datetime.strptime(fecha_str, "%Y-%m-%d")
-        dias_semana = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
-        meses = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
-                 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+        # Definir ventana de tiempo
+        ahora = datetime.datetime.now()
+        fin_periodo = ahora + datetime.timedelta(days=dias)
         
-        dia_semana = dias_semana[fecha_obj.weekday()]
-        mes = meses[fecha_obj.month - 1]
+        # Consultar eventos
+        eventos = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=ahora.isoformat() + "-05:00",
+            timeMax=fin_periodo.isoformat() + "-05:00",
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
         
-        return f"{dia_semana} {fecha_obj.day} de {mes}"
-    except:
-        return fecha_str
+        items = eventos.get('items', [])
+        
+        # Calcular estadísticas
+        total_citas = len(items)
+        citas_por_dia = {}
+        
+        for evento in items:
+            try:
+                inicio = evento.get('start', {}).get('dateTime', '')
+                if inicio:
+                    fecha = inicio.split('T')[0]
+                    citas_por_dia[fecha] = citas_por_dia.get(fecha, 0) + 1
+            except:
+                continue
+        
+        estadisticas = {
+            'total_citas_proximos_dias': total_citas,
+            'dias_analizados': dias,
+            'citas_por_dia': citas_por_dia,
+            'promedio_citas_dia': round(total_citas / dias, 2) if dias > 0 else 0,
+            'dia_mas_ocupado': max(citas_por_dia.items(), key=lambda x: x[1]) if citas_por_dia else None,
+            'timestamp_consulta': ahora.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        logger.info(f"📊 Estadísticas generadas: {total_citas} citas en {dias} días")
+        return estadisticas
+        
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo estadísticas: {str(e)}")
+        return None
+
+def verificar_conexion_calendar():
+    """
+    Verifica que la conexión con Google Calendar funcione correctamente.
+    
+    Returns:
+        bool: True si la conexión es exitosa
+    """
+    try:
+        # Intentar obtener información del calendario
+        calendar = service.calendars().get(calendarId=GOOGLE_CALENDAR_ID).execute()
+        logger.info(f"✅ Conexión verificada con calendario: {calendar.get('summary', 'Sin nombre')}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error verificando conexión: {str(e)}")
+        return False
+
+def inicializar_calendar_service():
+    """
+    Inicializa el servicio de calendario y verifica configuración.
+    
+    Returns:
+        bool: True si la inicialización es exitosa
+    """
+    try:
+        # Verificar conexión
+        if not verificar_conexion_calendar():
+            return False
+        
+        # Obtener estadísticas iniciales
+        stats = obtener_estadisticas_calendario(7)
+        if stats:
+            logger.info(f"📊 Estadísticas: {stats['total_citas_proximos_dias']} citas próximos 7 días")
+        
+        logger.info("✅ Servicio de calendario inicializado correctamente")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error inicializando servicio: {str(e)}")
+        return False
+
+if __name__ == "__main__":
+    # Pruebas de funcionamiento
+    print("📅 Módulo Google Calendar - Versión Producción")
+    print("=" * 50)
+    
+    if inicializar_calendar_service():
+        print("✅ Servicio inicializado exitosamente")
+        
+        # Mostrar estadísticas
+        stats = obtener_estadisticas_calendario(7)
+        if stats:
+            print(f"\n📊 ESTADÍSTICAS (próximos 7 días):")
+            print(f"   Total citas: {stats['total_citas_proximos_dias']}")
+            print(f"   Promedio por día: {stats['promedio_citas_dia']}")
+            if stats['dia_mas_ocupado']:
+                fecha, cantidad = stats['dia_mas_ocupado']
+                print(f"   Día más ocupado: {formatear_fecha_amigable(fecha)} ({cantidad} citas)")
+        
+        # Probar horarios disponibles para mañana
+        mañana = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        horarios = generar_horarios_disponibles(mañana)
+        print(f"\n🕐 Horarios disponibles para {formatear_fecha_amigable(mañana)}:")
+        for i, horario in enumerate(horarios[:5], 1):  # Mostrar solo los primeros 5
+            print(f"   {i}. {horario}")
+        
+    else:
+        print("❌ Error en la inicialización")
+        print("Verifica tu configuración en el archivo .env")

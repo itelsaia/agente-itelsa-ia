@@ -1,9 +1,14 @@
-# app.py - Versión Producción Limpia
+# app.py - Versión Producción Limpia para WhatsApp Business API
 import os
 import re
+import logging
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from openai import OpenAI
-from datetime import datetime, timedelta
+import requests
+
+# Importar módulos personalizados
 from guardar_datos_google_sheets import guardar_datos, verificar_usuario
 from calendar_service import agendar_en_calendar, formatear_fecha_amigable
 from registro_agendamiento import (
@@ -13,98 +18,121 @@ from registro_agendamiento import (
 )
 from scraper import extraer_contenido_web
 
+# Configurar logging para producción
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('chatbot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Cargar variables de entorno
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Variables globales para manejar el estado del usuario
-usuario_actual = {}
-pendiente_confirmacion = {}
-agendamiento_exitoso = False
-pregunto_sobre_asesoria = False
-es_segunda_oportunidad = False
+# Inicializar Flask
+app = Flask(__name__)
+
+# Configuración de APIs
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+
+# CONFIGURACIÓN DE EMPRESA - PERSONALIZAR AQUÍ
+EMPRESA_CONFIG = {
+    "nombre": "ITELSA IA",  # CAMBIAR: Nombre de tu empresa
+    "url_website": "https://itelsaia.com",  # CAMBIAR: URL de tu website
+    "horario_atencion": "lunes a viernes de 8:00am a 5:00pm",  # CAMBIAR: Tu horario
+    "telefono_soporte": "+57 300 123 4567",  # CAMBIAR: Tu teléfono
+    "email_soporte": "soporte@itelsaia.com"  # CAMBIAR: Tu email
+}
+
+# Inicializar OpenAI
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Almacenamiento temporal de sesiones de usuario (en producción usar Redis/Database)
+sesiones_usuarios = {}
+
+class GestorSesion:
+    """Maneja las sesiones de conversación de usuarios"""
+    
+    def __init__(self, telefono):
+        self.telefono = telefono
+        self.estado = "inicial"  # inicial, registrando, conversando, agendando
+        self.datos_usuario = {}
+        self.pendiente_confirmacion = {}
+        self.pregunto_sobre_asesoria = False
+        self.es_segunda_oportunidad = False
+        self.ultimo_mensaje = datetime.now()
+        
+    def actualizar_actividad(self):
+        self.ultimo_mensaje = datetime.now()
+        
+    def es_sesion_activa(self):
+        """Verifica si la sesión sigue activa (últimos 30 minutos)"""
+        tiempo_limite = datetime.now() - timedelta(minutes=30)
+        return self.ultimo_mensaje > tiempo_limite
+
+def obtener_sesion(telefono):
+    """Obtiene o crea una sesión para un usuario"""
+    if telefono not in sesiones_usuarios:
+        sesiones_usuarios[telefono] = GestorSesion(telefono)
+    
+    sesion = sesiones_usuarios[telefono]
+    
+    # Limpiar sesión si es muy antigua
+    if not sesion.es_sesion_activa():
+        sesiones_usuarios[telefono] = GestorSesion(telefono)
+    
+    sesiones_usuarios[telefono].actualizar_actividad()
+    return sesiones_usuarios[telefono]
+
+def enviar_mensaje_whatsapp(telefono, mensaje):
+    """
+    Envía mensaje por WhatsApp Business API
+    PERSONALIZAR: Ajustar según tu configuración de WhatsApp
+    """
+    try:
+        url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+        
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "messaging_product": "whatsapp",
+            "to": telefono,
+            "type": "text",
+            "text": {"body": mensaje}
+        }
+        
+        response = requests.post(url, json=data, headers=headers)
+        
+        if response.status_code == 200:
+            logger.info(f"Mensaje enviado exitosamente a {telefono}")
+            return True
+        else:
+            logger.error(f"Error enviando mensaje: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error en envío de WhatsApp: {str(e)}")
+        return False
 
 def es_correo_valido(correo):
+    """Valida formato de correo electrónico"""
     patron = r'^[\w\.-]+@[\w\.-]+\.\w{2,4}$'
-    return re.match(patron, correo)
-
-def recolectar_datos_usuario():
-    global usuario_actual, es_segunda_oportunidad
-    
-    print("\n🤖 ¡Hola! Soy el asistente de ITELSA IA.")
-    print("📩 Para ayudarte mejor, por favor ingresa tu correo electrónico.\n")
-
-    while True:
-        correo = input("📧 ¿Cuál es tu correo electrónico?: ").strip()
-        
-        if not es_correo_valido(correo):
-            print("❌ El correo electrónico no es válido. Inténtalo nuevamente.")
-            continue
-        
-        nombre_encontrado = verificar_usuario(correo)
-        
-        if nombre_encontrado:
-            estado_asesoria = verificar_estado_asesoria_usuario(correo)
-            
-            if estado_asesoria['tiene_rechazo'] and not estado_asesoria['tiene_cita_exitosa']:
-                print(f"👋 ¡Hola de nuevo, {nombre_encontrado}! Qué gusto verte otra vez.")
-                
-                usuario_actual = {
-                    'nombre': nombre_encontrado,
-                    'correo': correo,
-                    'es_nuevo': False,
-                    'telefono': None
-                }
-                es_segunda_oportunidad = True
-                iniciar_chat_llm()
-                return
-            else:
-                print(f"👋 ¡Hola de nuevo, {nombre_encontrado}! Qué gusto verte otra vez.")
-                usuario_actual = {
-                    'nombre': nombre_encontrado,
-                    'correo': correo,
-                    'es_nuevo': False,
-                    'telefono': None
-                }
-                es_segunda_oportunidad = False
-                iniciar_chat_llm()
-                return
-        else:
-            print("✨ ¡Bienvenido a ITELSA IA! Eres un usuario nuevo, vamos a registrarte.")
-            es_segunda_oportunidad = False
-            break
-    
-    nombre = input("👤 ¿Cuál es tu nombre completo?: ").strip()
-    telefono = input("📱 ¿Cuál es tu número de contacto?: ").strip()
-    servicio = input("💼 ¿Qué servicio de ITELSA IA te interesa?: ").strip()
-    comentario = input("📝 ¿Deseas dejar algún comentario adicional?: ").strip()
-
-    print("\n✅ Confirma tus datos:")
-    print(f"👤 Nombre: {nombre}\n📧 Correo: {correo}\n📱 Teléfono: {telefono}\n💼 Servicio: {servicio}\n📝 Comentario: {comentario}")
-
-    confirmacion = input("\n¿Son correctos estos datos? (sí/no): ").strip().lower()
-    if confirmacion in ["sí", "si", "s"]:
-        resultado = guardar_datos(nombre, correo, telefono, servicio, comentario)
-        if resultado:
-            print("\n✅ ¡Datos registrados con éxito! Ahora puedes hablar con el agente.\n")
-            
-            usuario_actual = {
-                'nombre': nombre,
-                'correo': correo,
-                'es_nuevo': True,
-                'telefono': telefono
-            }
-            iniciar_chat_llm()
-        else:
-            print("\n❌ Error al guardar datos. Intenta nuevamente.")
-            recolectar_datos_usuario()
-    else:
-        print("\n❌ Registro cancelado. Volviendo al inicio...")
-        recolectar_datos_usuario()
+    return re.match(patron, correo) is not None
 
 def extraer_fecha_hora(texto):
+    """Extrae fecha y hora del texto del usuario"""
     ahora = datetime.now()
     
+    # PERSONALIZAR: Ajustar patrones según tu región/idioma
     patrones_fecha_hora = [
         r'para (mañana|hoy|pasado mañana) a las (\d{1,2}(?::\d{2})?)(am|pm)',
         r'(mañana|hoy|pasado mañana) a las (\d{1,2}(?::\d{2})?)(am|pm)',
@@ -115,39 +143,45 @@ def extraer_fecha_hora(texto):
     for i, patron in enumerate(patrones_fecha_hora):
         match = re.search(patron, texto.lower())
         if match:
-            if i == 3:
-                fecha = datetime.strptime(match.group(1), "%Y-%m-%d")
-                hora = f"{match.group(2)}:{match.group(3)}"
-                fecha_str = fecha.strftime("%Y-%m-%d")
-                return fecha_str, hora
-            
-            if i in [0, 1]:
-                dia = match.group(1)
-                hora_texto = match.group(2)
-                am_pm = match.group(3)
-            else:
-                hora_texto = match.group(1)
-                am_pm = match.group(2)
-                dia = match.group(3)
-            
-            if dia == "mañana":
-                fecha = ahora + timedelta(days=1)
-            elif dia == "hoy":
-                fecha = ahora
-            elif dia == "pasado mañana":
-                fecha = ahora + timedelta(days=2)
-            
-            if ":" not in hora_texto:
-                hora_completa = f"{hora_texto}:00{am_pm}"
-            else:
-                hora_completa = f"{hora_texto}{am_pm}"
-            
-            fecha_str = fecha.strftime("%Y-%m-%d")
-            return fecha_str, hora_completa
+            try:
+                if i == 3:  # Formato fecha completa
+                    fecha = datetime.strptime(match.group(1), "%Y-%m-%d")
+                    hora = f"{match.group(2)}:{match.group(3)}"
+                    return fecha.strftime("%Y-%m-%d"), hora
+                
+                # Procesar días relativos
+                if i in [0, 1]:
+                    dia = match.group(1)
+                    hora_texto = match.group(2)
+                    am_pm = match.group(3)
+                else:
+                    hora_texto = match.group(1)
+                    am_pm = match.group(2)
+                    dia = match.group(3)
+                
+                # Calcular fecha
+                if dia == "mañana":
+                    fecha = ahora + timedelta(days=1)
+                elif dia == "hoy":
+                    fecha = ahora
+                elif dia == "pasado mañana":
+                    fecha = ahora + timedelta(days=2)
+                
+                # Formatear hora
+                if ":" not in hora_texto:
+                    hora_completa = f"{hora_texto}:00{am_pm}"
+                else:
+                    hora_completa = f"{hora_texto}{am_pm}"
+                
+                return fecha.strftime("%Y-%m-%d"), hora_completa
+                
+            except Exception:
+                continue
     
     return None, None
 
 def detectar_seleccion_opcion(texto, horarios_disponibles):
+    """Detecta si el usuario seleccionó una opción de horario"""
     texto_lower = texto.lower()
     
     patrones_seleccion = [
@@ -155,8 +189,7 @@ def detectar_seleccion_opcion(texto, horarios_disponibles):
         r'la\s*(\d+)',
         r'el\s*(\d+)',
         r'n[úu]mero\s*(\d+)',
-        r'^(\d+)$',
-        r'^\s*(\d+)\s*$'
+        r'^(\d+)$'
     ]
     
     for patron in patrones_seleccion:
@@ -169,334 +202,493 @@ def detectar_seleccion_opcion(texto, horarios_disponibles):
             except (ValueError, IndexError):
                 continue
     
-    if any(palabra in texto_lower for palabra in ['sí', 'si', 'ok', 'está bien', 'me parece bien', 'perfecto', 'dale', 'confirmo']):
+    # Respuestas afirmativas para una sola opción
+    if any(palabra in texto_lower for palabra in ['sí', 'si', 'ok', 'está bien', 'perfecto']):
         if len(horarios_disponibles) == 1:
             return horarios_disponibles[0]
     
     return None
 
 def detectar_solicitud_agendamiento(texto):
+    """Detecta si el usuario quiere agendar una cita"""
     texto_lower = texto.lower().strip()
     
+    # PERSONALIZAR: Ajustar frases según tu contexto de negocio
     frases_agendamiento = [
-        'quiero agendar', 'me gustaría agendar', 'quisiera agendar', 'necesito agendar',
-        'quiero una cita', 'necesito una cita', 'me gustaría una cita', 'quisiera una cita',
-        'quiero programar', 'puedo agendar', 'es posible agendar', 'agendar una cita',
-        'agendar cita', 'programar cita', 'reservar cita', 'solicitar cita',
-        'quiero más asesoría', 'otra asesoría', 'nueva asesoría', 'segunda asesoría',
-        'quiero reunión', 'solicitar reunión', 'programar reunión',
-        'sí quiero', 'claro que sí', 'acepto', 'me interesa', 'por favor'
+        'quiero agendar', 'me gustaría agendar', 'necesito agendar',
+        'quiero una cita', 'necesito una cita', 'quisiera una cita',
+        'quiero programar', 'puedo agendar', 'agendar una cita',
+        'quiero más asesoría', 'otra asesoría', 'nueva asesoría',
+        'sí quiero', 'claro que sí', 'acepto', 'me interesa'
     ]
     
-    for frase in frases_agendamiento:
-        if frase in texto_lower:
-            return True
-    
-    return False
+    return any(frase in texto_lower for frase in frases_agendamiento)
 
 def detectar_rechazo_asesoria(texto):
+    """Detecta si el usuario rechaza la asesoría"""
     texto_lower = texto.lower().strip()
     
     if texto_lower in ['no', 'nope', 'nah', 'no gracias']:
         return True
     
     frases_rechazo = [
-        'no quiero agendar', 'no me interesa', 'no gracias', 'no estoy interesado', 
-        'no tengo tiempo', 'no puedo', 'ahora no', 'después', 'más tarde',
-        'no quiero', 'no necesito', 'tal vez después', 'en otro momento',
-        'no me convence', 'no por ahora', 'prefiero no', 'no es para mí',
-        'no deseo', 'no me parece', 'mejor no', 'no creo',
-        'otro día', 'otro momento', 'mejor después', 'quizás después'
+        'no quiero agendar', 'no me interesa', 'no estoy interesado',
+        'no tengo tiempo', 'no puedo', 'ahora no', 'después',
+        'no quiero', 'no necesito', 'tal vez después', 'mejor no'
     ]
     
-    for frase in frases_rechazo:
-        if frase in texto_lower:
-            return True
-    
-    if 'no' in texto_lower and any(palabra in texto_lower for palabra in ['agendar', 'cita', 'asesoría', 'reunión']):
-        return True
-    
-    return False
+    return any(frase in texto_lower for frase in frases_rechazo)
 
-def detectar_respuesta_simple(texto):
-    texto_lower = texto.lower().strip()
-    
-    if any(palabra in texto_lower for palabra in ['sí', 'si', 'yes', 'claro', 'por favor', 'dame información', 'me gustaría', 'quisiera', 'necesito', 'tengo preguntas']):
-        return 'afirmativa'
-    
-    if any(palabra in texto_lower for palabra in ['no', 'nada', 'gracias', 'está bien', 'perfecto', 'listo', 'todo bien', 'no necesito']):
-        return 'negativa'
-    
-    return 'otra'
-
-def generar_mensaje_amigable(resultado, fecha, hora):
-    global usuario_actual, es_segunda_oportunidad
-    
+def generar_mensaje_agendamiento(resultado, fecha, hora, sesion):
+    """Genera mensaje amigable para resultado de agendamiento"""
     if resultado['disponible']:
         fecha_amigable = formatear_fecha_amigable(fecha)
         
-        if es_segunda_oportunidad:
-            observaciones = "Asesoría gratuita agendada con éxito - Segunda oportunidad (usuario cambió de opinión)"
-        elif usuario_actual['es_nuevo']:
-            observaciones = "Asesoría gratuita agendada con éxito - Usuario nuevo"
+        # Determinar tipo de asesoría
+        if sesion.es_segunda_oportunidad:
+            observaciones = f"Asesoría gratuita - Segunda oportunidad"
+        elif sesion.datos_usuario.get('es_nuevo', False):
+            observaciones = f"Asesoría gratuita - Usuario nuevo"
         else:
-            observaciones = "Asesoría agendada - Usuario existente"
+            observaciones = f"Asesoría programada"
         
-        if usuario_actual['correo']:
-            registrar_agendamiento_completo(
-                usuario_actual['correo'], 
-                fecha, 
-                hora, 
-                observaciones
-            )
+        # Registrar en base de datos
+        correo = sesion.datos_usuario.get('correo')
+        if correo:
+            registrar_agendamiento_completo(correo, fecha, hora, observaciones)
         
-        return f"¡Perfecto! ✅ Tu cita ha sido agendada exitosamente para el {fecha_amigable} a las {hora}. Recibirás una confirmación en tu correo electrónico.\n\n¿Hay algo más en lo que pueda ayudarte sobre nuestros servicios de inteligencia artificial? ¿O tienes alguna pregunta sobre tu próxima asesoría?"
+        return (f"¡Perfecto! ✅ Tu cita ha sido agendada para el {fecha_amigable} a las {hora}.\n\n"
+                f"Recibirás confirmación por correo electrónico.\n\n"
+                f"¿Hay algo más en lo que pueda ayudarte?")
     
+    # Manejar diferentes motivos de no disponibilidad
     motivo = resultado['motivo']
+    fecha_amigable = formatear_fecha_amigable(fecha)
     
     if motivo == 'fuera_horario_laboral':
-        mensaje = f"Entiendo que prefieres esa hora, pero nuestro horario de atención es de lunes a viernes de 8:00am a 5:00pm. 😊\n\n"
+        mensaje = f"Nuestro horario es {EMPRESA_CONFIG['horario_atencion']}. 😊\n\n"
         if resultado['horarios_alternativos']:
-            fecha_amigable = formatear_fecha_amigable(fecha)
-            mensaje += f"Te propongo algunos horarios disponibles para el {fecha_amigable}:\n"
+            mensaje += f"Horarios disponibles para el {fecha_amigable}:\n"
             for i, horario in enumerate(resultado['horarios_alternativos'], 1):
-                mensaje += f"   {i}. {horario}\n"
-            mensaje += "\n¿Alguno de estos horarios te conviene mejor? Solo dime el número de la opción que prefieras."
-            global pendiente_confirmacion
-            pendiente_confirmacion[fecha_amigable] = {
+                mensaje += f"{i}. {horario}\n"
+            mensaje += "\n¿Cuál prefieres? Solo envía el número."
+            
+            # Guardar opciones en sesión
+            sesion.pendiente_confirmacion[fecha_amigable] = {
                 'fecha': fecha,
                 'horarios': resultado['horarios_alternativos']
             }
-        else:
-            mensaje += "Por favor, elígenos otro horario dentro de nuestro horario de atención. ¡Estaremos encantados de atenderte!"
         return mensaje
     
     elif motivo == 'fin_semana':
         fecha_alt = resultado.get('fecha_alternativa', fecha)
-        fecha_amigable = formatear_fecha_amigable(fecha_alt)
-        mensaje = f"Los fines de semana no tenemos atención, pero estaremos listos para ti el {fecha_amigable}. 📅\n\n"
+        fecha_amigable_alt = formatear_fecha_amigable(fecha_alt)
+        mensaje = f"No atendemos fines de semana, pero el {fecha_amigable_alt} sí. 📅\n\n"
         if resultado['horarios_alternativos']:
-            mensaje += f"Aquí tienes algunos horarios disponibles para ese día:\n"
+            mensaje += f"Horarios disponibles:\n"
             for i, horario in enumerate(resultado['horarios_alternativos'], 1):
-                mensaje += f"   {i}. {horario}\n"
-            mensaje += "\n¿Te parece bien alguno de estos horarios? Solo dime el número."
-            pendiente_confirmacion[fecha_amigable] = {
+                mensaje += f"{i}. {horario}\n"
+            mensaje += "\n¿Te parece bien alguno? Envía el número."
+            
+            sesion.pendiente_confirmacion[fecha_amigable_alt] = {
                 'fecha': fecha_alt,
                 'horarios': resultado['horarios_alternativos']
             }
         return mensaje
     
     elif motivo == 'horario_ocupado':
-        fecha_amigable = formatear_fecha_amigable(fecha)
-        mensaje = f"Ese horario ya está ocupado para el {fecha_amigable}, pero tengo otras opciones disponibles: 🕐\n\n"
+        mensaje = f"Ese horario está ocupado para el {fecha_amigable}. 🕐\n\n"
         if resultado['horarios_alternativos']:
+            mensaje += f"Otras opciones disponibles:\n"
             for i, horario in enumerate(resultado['horarios_alternativos'], 1):
-                mensaje += f"   {i}. {horario}\n"
-            mensaje += "\n¿Cuál prefieres? Solo dime el número de la opción."
-            pendiente_confirmacion[fecha_amigable] = {
+                mensaje += f"{i}. {horario}\n"
+            mensaje += "\n¿Cuál prefieres? Envía el número."
+            
+            sesion.pendiente_confirmacion[fecha_amigable] = {
                 'fecha': fecha,
                 'horarios': resultado['horarios_alternativos']
             }
-        else:
-            mensaje += "Por favor, elígenos otro horario y verificaré la disponibilidad inmediatamente."
         return mensaje
     
-    else:
-        return "Ups, parece que hubo un pequeño inconveniente. ¿Podrías intentar con otro horario? Estoy aquí para ayudarte a encontrar la cita perfecta. 😊"
+    return "Hubo un inconveniente. ¿Podrías intentar con otro horario? 😊"
 
-def iniciar_chat_llm():
-    global pendiente_confirmacion, agendamiento_exitoso, pregunto_sobre_asesoria, usuario_actual, es_segunda_oportunidad
-    
-    pendiente_confirmacion = {}
-    agendamiento_exitoso = False
-    pregunto_sobre_asesoria = False
-    
-    nombre_usuario = usuario_actual['nombre']
-    correo = usuario_actual['correo']
-    es_usuario_nuevo = usuario_actual['es_nuevo']
-    telefono = usuario_actual.get('telefono')
-    
-    url_cliente = "https://itelsaia.com"
-    contenido_web = extraer_contenido_web(url_cliente) or ""
-
+def procesar_mensaje_usuario(telefono, mensaje):
+    """
+    Función principal que procesa mensajes de usuario
+    PERSONALIZAR: Aquí puedes ajustar la lógica de negocio
+    """
     try:
-        with open("contenido_fijo.txt", "r", encoding="utf-8") as file:
-            contenido_manual = file.read()
-    except FileNotFoundError:
-        contenido_manual = "No hay contenido manual cargado."
-
-    contexto_completo = contenido_manual + "\n\n" + contenido_web
-
-    if es_segunda_oportunidad:
-        prompt_sistema = (
-            f"Eres un asistente amigable pero directo de ITELSA IA. {nombre_usuario} es un usuario registrado que anteriormente "
-            f"rechazó su asesoría gratuita, pero ha regresado. Tu MISIÓN es conseguir que agende la asesoría AHORA.\n\n"
-            f"ESTRATEGIA DIRECTA:\n"
-            f"1. Sé cálido pero directo - pregunta inmediatamente sobre agendar\n"
-            f"2. Enfócate en los beneficios de la asesoría GRATUITA\n"
-            f"3. Si muestra cualquier señal de interés, facilita inmediatamente el agendamiento\n"
-            f"4. Si dice 'sí' o muestra interés, ve directo a solicitar fecha y hora\n"
-            f"5. No hagas preguntas generales sobre necesidades, ve directo al agendamiento\n\n"
-            f"CONTEXTO DE SERVICIOS:\n{contexto_completo}"
-        )
-        mensaje_inicial = f"¡Hola de nuevo, {nombre_usuario}! 👋 Qué gusto verte otra vez.\n\nVeo que aún no has podido aprovechar tu primera asesoría gratuita con ITELSA IA. ✨ Las circunstancias pueden haber cambiado, ¿te gustaría agendar tu asesoría gratuita ahora? Es una excelente oportunidad para que podamos ayudarte específicamente con tus necesidades de inteligencia artificial. 🚀\n\n¿Cuándo te vendría bien programar tu consulta gratuita?"
+        sesion = obtener_sesion(telefono)
+        mensaje_limpio = mensaje.strip()
         
-    elif es_usuario_nuevo:
-        prompt_sistema = (
-            f"Eres un asistente de ventas experto de ITELSA IA. {nombre_usuario} es un usuario COMPLETAMENTE NUEVO "
-            f"y tu ÚNICA MISIÓN es que agende su primera asesoría GRATUITA.\n\n"
-            f"REGLAS ESTRICTAS:\n"
-            f"1. Responde amablemente a sus preguntas\n"
-            f"2. OBLIGATORIO: Después de CADA respuesta, debes preguntarle sobre agendar:\n"
-            f"   - '¿Te gustaría agendar tu primera asesoría gratuita ahora mismo?'\n"
-            f"   - '¿Cuándo podrías tener 30 minutos para tu consulta gratuita?'\n"
-            f"   - '¿Te interesa programar una reunión sin costo para conocer nuestros servicios?'\n"
-            f"3. NUNCA termines sin invitar a agendar\n"
-            f"4. Si dice NO, respeta pero insiste gentilmente en el siguiente mensaje\n"
-            f"5. Enfoca todos los beneficios en la asesoría GRATUITA\n\n"
-            f"CONTEXTO DE SERVICIOS:\n{contexto_completo}"
-        )
-        mensaje_inicial = f"¡Excelente {nombre_usuario}! Ya tienes tu cuenta creada con nosotros. 🎉\n\nCuéntame: ¿qué aspecto específico de nuestros servicios de inteligencia artificial te interesa más? ¿Automatización de procesos, análisis de datos, chatbots inteligentes o consultoría estratégica? 🤖"
-    else:
-        prompt_sistema = (
-            f"Eres un asistente de soporte profesional de ITELSA IA hablando con {nombre_usuario}, "
-            f"quien ya es un cliente registrado y confiable.\n\n"
-            f"Tu objetivo es:\n"
-            f"1. Brindar excelente soporte y información\n"
-            f"2. Resolver todas sus dudas técnicas\n"
-            f"3. Ser cálido y profesional\n"
-            f"4. SOLO agendar si él expresamente lo solicita\n"
-            f"5. No presionar para ventas adicionales\n\n"
-            f"CONTEXTO DE SERVICIOS:\n{contexto_completo}"
-        )
-        mensaje_inicial = f"¡Hola {nombre_usuario}! Es un placer tenerte de vuelta. ¿En qué puedo ayudarte hoy? 😊"
-
-    print(f"🤖 ITELSA IA: {mensaje_inicial}")
-    
-    mensajes = [{"role": "system", "content": prompt_sistema}]
-
-    while True:
-        entrada = input(f"\n{nombre_usuario}: ").strip()
-        
-        if entrada.lower() in ["salir", "terminar", "adiós", "adios"]:
-            if es_segunda_oportunidad:
-                print("\n🤖 ITELSA IA: ¡Gracias por darme la oportunidad de conversar contigo! Estaré aquí cuando estés listo. ¡Hasta pronto! 👋")
-            elif es_usuario_nuevo:
-                print("\n🤖 ITELSA IA: ¡Gracias por conocer ITELSA IA! Recuerda que tu asesoría gratuita te está esperando. ¡Hasta pronto! 👋")
-            else:
-                print("\n🤖 ITELSA IA: ¡Gracias por contactarnos! Siempre estamos aquí para apoyarte. ¡Que tengas un excelente día! 👋")
-            break
-
-        entrada_procesada = False
-
-        if agendamiento_exitoso:
-            tipo_respuesta = detectar_respuesta_simple(entrada)
+        # Comando para reiniciar conversación
+        if mensaje_limpio.lower() in ['reiniciar', 'empezar', 'start', 'hola']:
+            sesion.estado = "inicial"
+            sesion.datos_usuario = {}
+            sesion.pendiente_confirmacion = {}
             
-            if tipo_respuesta == 'negativa':
-                print("\n🤖 ITELSA IA: ¡Perfecto! Ha sido un placer ayudarte. Nos vemos en tu asesoría. ¡Que tengas un excelente día! 🌟")
-                agendamiento_exitoso = False
-                entrada_procesada = True
-            elif tipo_respuesta == 'afirmativa':
-                print("\n🤖 ITELSA IA: ¡Genial! Estaré encantado de ayudarte. ¿Qué más te gustaría saber sobre nuestros servicios?")
-                agendamiento_exitoso = False
-                entrada_procesada = True
+            return (f"¡Hola! 👋 Soy el asistente de {EMPRESA_CONFIG['nombre']}.\n\n"
+                   f"Para ayudarte mejor, ¿podrías compartir tu correo electrónico?")
+        
+        # Estado inicial - solicitar correo
+        if sesion.estado == "inicial":
+            if not es_correo_valido(mensaje_limpio):
+                return "Por favor, ingresa un correo electrónico válido. 📧"
+            
+            # Verificar si es usuario existente
+            nombre_encontrado = verificar_usuario(mensaje_limpio)
+            
+            if nombre_encontrado:
+                estado_asesoria = verificar_estado_asesoria_usuario(mensaje_limpio)
+                
+                sesion.datos_usuario = {
+                    'nombre': nombre_encontrado,
+                    'correo': mensaje_limpio,
+                    'es_nuevo': False
+                }
+                
+                # Usuario con rechazo previo (segunda oportunidad)
+                if estado_asesoria['tiene_rechazo'] and not estado_asesoria['tiene_cita_exitosa']:
+                    sesion.es_segunda_oportunidad = True
+                    sesion.estado = "conversando"
+                    
+                    return (f"¡Hola de nuevo, {nombre_encontrado}! 👋\n\n"
+                           f"Veo que aún no has aprovechado tu asesoría gratuita. "
+                           f"¿Te gustaría programarla ahora? Es una excelente oportunidad "
+                           f"para ayudarte con tus necesidades específicas. 🚀\n\n"
+                           f"¿Cuándo te vendría bien?")
+                
+                # Usuario existente normal
+                else:
+                    sesion.estado = "conversando" 
+                    return (f"¡Hola {nombre_encontrado}! 😊\n\n"
+                           f"Es un placer tenerte de vuelta. ¿En qué puedo ayudarte hoy?")
+            
+            # Usuario nuevo - solicitar datos
             else:
-                agendamiento_exitoso = False
-
-        if not entrada_procesada and pendiente_confirmacion:
-            for fecha_amigable, datos in pendiente_confirmacion.items():
-                hora_seleccionada = detectar_seleccion_opcion(entrada, datos['horarios'])
-                if hora_seleccionada:
-                    fecha = datos['fecha']
-                    resultado = agendar_en_calendar(nombre_usuario, correo, telefono, fecha, hora_seleccionada)
-                    respuesta_amigable = generar_mensaje_amigable(resultado, fecha, hora_seleccionada)
-                    print(f"\n🤖 ITELSA IA: {respuesta_amigable}")
-                    pendiente_confirmacion = {}
-                    
-                    if resultado['disponible']:
-                        agendamiento_exitoso = True
-                    
-                    entrada_procesada = True
-                    break
-
-        if not entrada_procesada and correo:
-            fecha, hora = extraer_fecha_hora(entrada)
-            if fecha and hora:
-                resultado = agendar_en_calendar(nombre_usuario, correo, telefono, fecha, hora)
-                respuesta_amigable = generar_mensaje_amigable(resultado, fecha, hora)
-                print(f"\n🤖 ITELSA IA: {respuesta_amigable}")
+                sesion.estado = "registrando"
+                sesion.datos_usuario['correo'] = mensaje_limpio
+                return (f"¡Bienvenido a {EMPRESA_CONFIG['nombre']}! ✨\n\n"
+                       f"Eres nuevo aquí. ¿Cuál es tu nombre completo?")
+        
+        # Estado registrando - recolectar datos
+        elif sesion.estado == "registrando":
+            if 'nombre' not in sesion.datos_usuario:
+                sesion.datos_usuario['nombre'] = mensaje_limpio
+                return "¿Cuál es tu número de teléfono? 📱"
+            
+            elif 'telefono' not in sesion.datos_usuario:
+                sesion.datos_usuario['telefono'] = mensaje_limpio
+                return f"¿Qué servicio de {EMPRESA_CONFIG['nombre']} te interesa? 💼"
+            
+            elif 'servicio' not in sesion.datos_usuario:
+                sesion.datos_usuario['servicio'] = mensaje_limpio
+                return "¿Deseas dejar algún comentario adicional? (o escribe 'ninguno') 📝"
+            
+            elif 'comentario' not in sesion.datos_usuario:
+                sesion.datos_usuario['comentario'] = mensaje_limpio if mensaje_limpio.lower() != 'ninguno' else ""
                 
-                if resultado['disponible']:
-                    agendamiento_exitoso = True
+                # Confirmar datos
+                datos = sesion.datos_usuario
+                confirmacion = (f"Confirma tus datos:\n\n"
+                               f"👤 Nombre: {datos['nombre']}\n"
+                               f"📧 Correo: {datos['correo']}\n"
+                               f"📱 Teléfono: {datos['telefono']}\n"
+                               f"💼 Servicio: {datos['servicio']}\n"
+                               f"📝 Comentario: {datos['comentario']}\n\n"
+                               f"¿Son correctos? (sí/no)")
                 
-                entrada_procesada = True
-
-        if not entrada_procesada and correo:
-            if detectar_solicitud_agendamiento(entrada):
-                if es_segunda_oportunidad:
-                    print("\n🤖 ITELSA IA: ¡Qué excelente decisión! 🌟 Me alegra mucho que quieras aprovechar esta oportunidad. ¿Cuál sería tu fecha y hora preferida? Nuestro horario es de lunes a viernes de 8:00am a 5:00pm.")
-                    pregunto_sobre_asesoria = True
-                elif es_usuario_nuevo:
-                    print("\n🤖 ITELSA IA: ¡Fantástico! 🎉 Me emociona que quieras aprovechar tu asesoría gratuita. ¿Cuál sería tu fecha y hora preferida? Nuestro horario es de lunes a viernes de 8:00am a 5:00pm.")
-                    pregunto_sobre_asesoria = True
-                else:
-                    print("\n🤖 ITELSA IA: ¡Por supuesto! Estaré encantado de ayudarte a agendar una nueva asesoría. ¿Cuál sería tu fecha y hora preferida?")
-                entrada_procesada = True
-
-        if not entrada_procesada and (es_usuario_nuevo or es_segunda_oportunidad):
-            if detectar_rechazo_asesoria(entrada):
-                if es_segunda_oportunidad:
-                    print("\n🤖 ITELSA IA: Lo entiendo perfectamente, respeto tu decisión. Sabes que siempre estaremos aquí cuando necesites nuestros servicios. ¡Que tengas un excelente día! 😊")
-                    entrada_procesada = True
-                else:
-                    registrar_rechazo_asesoria(correo, "Usuario nuevo rechazó asesoría gratuita")
-                    pregunto_sobre_asesoria = False
-                    print("\n🤖 ITELSA IA: Entiendo perfectamente, no hay problema. La oferta de tu asesoría gratuita seguirá disponible cuando estés listo. ¡Que tengas un excelente día! 😊")
-                    entrada_procesada = True
-
-        if not entrada_procesada:
-            mensajes.append({"role": "user", "content": entrada})
-
-            try:
-                respuesta = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=mensajes,
-                    temperature=0.7,
-                    max_tokens=600
+                sesion.estado = "confirmando_datos"
+                return confirmacion
+        
+        # Estado confirmando datos
+        elif sesion.estado == "confirmando_datos":
+            if mensaje_limpio.lower() in ['sí', 'si', 's', 'yes', 'correcto']:
+                # Guardar en base de datos
+                datos = sesion.datos_usuario
+                resultado = guardar_datos(
+                    datos['nombre'], datos['correo'], datos['telefono'],
+                    datos['servicio'], datos['comentario']
                 )
-                reply = respuesta.choices[0].message.content
-                print(f"\n🤖 ITELSA IA: {reply}")
-                mensajes.append({"role": "assistant", "content": reply})
                 
-                if es_usuario_nuevo and not es_segunda_oportunidad:
-                    palabras_agendamiento = [
-                        'agendar', 'cita', 'asesoría', 'reunión', 'consulta',
-                        'cuando', 'programar', 'te interesa', 'quisieras',
-                        'gratuita', 'sin costo', 'primera vez', 'disponible'
-                    ]
+                if resultado:
+                    sesion.datos_usuario['es_nuevo'] = True
+                    sesion.estado = "conversando"
                     
-                    ya_pregunto = any(palabra in reply.lower() for palabra in palabras_agendamiento)
-                    
-                    if ya_pregunto:
-                        pregunto_sobre_asesoria = True
-                    else:
-                        import random
-                        preguntas_persuasivas = [
-                            "Por cierto, ¿te gustaría agendar tu primera asesoría gratuita para que podamos ayudarte específicamente con tu proyecto?",
-                            "¿Cuándo podrías tener 30 minutos para una consulta gratuita personalizada donde analizaríamos tu caso específico?",
-                            "¿Te interesa programar una reunión sin costo para que un experto revise tu situación particular?"
-                        ]
-                        
-                        pregunta_elegida = random.choice(preguntas_persuasivas)
-                        print(f"\n🤖 ITELSA IA: {pregunta_elegida}")
-                        mensajes.append({"role": "assistant", "content": pregunta_elegida})
-                        pregunto_sobre_asesoria = True
-                    
-            except Exception as e:
-                print(f"\n🤖 ITELSA IA: Disculpa, tuve un pequeño problema técnico. ¿Puedes repetir tu mensaje? 😊")
+                    return (f"¡Excelente! ✅ Tu cuenta ha sido creada.\n\n"
+                           f"Cuéntame: ¿qué aspecto específico de nuestros servicios te interesa más? "
+                           f"¿Automatización, análisis de datos, chatbots o consultoría estratégica? 🤖")
+                else:
+                    return "Hubo un error al guardar tus datos. Por favor, inténtalo nuevamente."
+            
+            elif mensaje_limpio.lower() in ['no', 'n', 'incorrecto']:
+                sesion.estado = "inicial"
+                sesion.datos_usuario = {}
+                return "Entendido. Volvamos a empezar. ¿Cuál es tu correo electrónico?"
+            
+            else:
+                return "Por favor, responde 'sí' o 'no' para confirmar tus datos."
+        
+        # Estado conversando - chatbot principal
+        elif sesion.estado == "conversando":
+            return procesar_conversacion_principal(sesion, mensaje_limpio)
+        
+        else:
+            # Estado no válido, reiniciar
+            sesion.estado = "inicial"
+            return "Algo salió mal. Empecemos de nuevo. ¿Cuál es tu correo electrónico?"
+    
+    except Exception as e:
+        logger.error(f"Error procesando mensaje: {str(e)}")
+        return "Disculpa, tuve un problema técnico. ¿Puedes intentar nuevamente?"
 
-if __name__ == "__main__":
-    print("="*60)
-    print("🚀 SISTEMA DE AGENTE IA - ITELSA IA")
-    print("="*60)
-    recolectar_datos_usuario()
+def procesar_conversacion_principal(sesion, mensaje):
+    """
+    Procesa la conversación principal con IA
+    PERSONALIZAR: Ajustar prompts y lógica según tu negocio
+    """
+    try:
+        # Verificar agendamiento pendiente
+        if sesion.pendiente_confirmacion:
+            for fecha_amigable, datos in sesion.pendiente_confirmacion.items():
+                hora_seleccionada = detectar_seleccion_opcion(mensaje, datos['horarios'])
+                if hora_seleccionada:
+                    # Procesar agendamiento
+                    resultado = agendar_en_calendar(
+                        sesion.datos_usuario['nombre'],
+                        sesion.datos_usuario['correo'],
+                        sesion.datos_usuario.get('telefono', ''),
+                        datos['fecha'],
+                        hora_seleccionada
+                    )
+                    
+                    sesion.pendiente_confirmacion = {}
+                    return generar_mensaje_agendamiento(resultado, datos['fecha'], hora_seleccionada, sesion)
+        
+        # Verificar solicitud de agendamiento directo
+        fecha, hora = extraer_fecha_hora(mensaje)
+        if fecha and hora:
+            resultado = agendar_en_calendar(
+                sesion.datos_usuario['nombre'],
+                sesion.datos_usuario['correo'],
+                sesion.datos_usuario.get('telefono', ''),
+                fecha,
+                hora
+            )
+            return generar_mensaje_agendamiento(resultado, fecha, hora, sesion)
+        
+        # Detectar solicitud de agendamiento
+        if detectar_solicitud_agendamiento(mensaje):
+            if sesion.es_segunda_oportunidad:
+                return (f"¡Excelente decisión! 🌟\n\n"
+                       f"¿Cuál sería tu fecha y hora preferida? "
+                       f"Nuestro horario es {EMPRESA_CONFIG['horario_atencion']}.")
+            else:
+                return (f"¡Perfecto! 🎉\n\n"
+                       f"¿Cuál sería tu fecha y hora preferida? "
+                       f"Nuestro horario es {EMPRESA_CONFIG['horario_atencion']}.")
+        
+        # Detectar rechazo de asesoría
+        if detectar_rechazo_asesoria(mensaje):
+            if sesion.datos_usuario.get('es_nuevo', False):
+                registrar_rechazo_asesoria(
+                    sesion.datos_usuario['correo'],
+                    "Usuario nuevo rechazó asesoría gratuita"
+                )
+            
+            return ("Entiendo perfectamente. La oferta seguirá disponible cuando estés listo. "
+                   "¡Que tengas un excelente día! 😊")
+        
+        # Procesar con IA
+        return generar_respuesta_ia(sesion, mensaje)
+    
+    except Exception as e:
+        logger.error(f"Error en conversación principal: {str(e)}")
+        return "Disculpa, tuve un problema. ¿Puedes repetir tu mensaje?"
+
+def generar_respuesta_ia(sesion, mensaje):
+    """
+    Genera respuesta usando OpenAI
+    PERSONALIZAR: Ajustar prompt según tu empresa y servicios
+    """
+    try:
+        # Cargar contenido de la empresa
+        contenido_web = extraer_contenido_web(EMPRESA_CONFIG['url_website']) or ""
+        
+        try:
+            with open("contenido_fijo.txt", "r", encoding="utf-8") as file:
+                contenido_manual = file.read()
+        except FileNotFoundError:
+            contenido_manual = f"Información de {EMPRESA_CONFIG['nombre']}: Empresa de servicios de IA."
+        
+        contexto_completo = contenido_manual + "\n\n" + contenido_web
+        
+        # Configurar prompt según tipo de usuario
+        nombre_usuario = sesion.datos_usuario.get('nombre', 'Usuario')
+        es_nuevo = sesion.datos_usuario.get('es_nuevo', False)
+        
+        if sesion.es_segunda_oportunidad:
+            prompt_sistema = (
+                f"Eres un asistente de {EMPRESA_CONFIG['nombre']}. {nombre_usuario} rechazó "
+                f"previamente su asesoría gratuita pero regresó. Tu misión es conseguir que agende AHORA.\n\n"
+                f"ESTRATEGIA:\n"
+                f"- Sé cálido pero directo\n"
+                f"- Enfócate en los beneficios de la asesoría GRATUITA\n"
+                f"- Si muestra interés, facilita inmediatamente el agendamiento\n"
+                f"- Pregunta sobre fecha y hora si dice que sí\n\n"
+                f"INFORMACIÓN DE LA EMPRESA:\n{contexto_completo}"
+            )
+        elif es_nuevo:
+            prompt_sistema = (
+                f"Eres un asistente de ventas de {EMPRESA_CONFIG['nombre']}. {nombre_usuario} es "
+                f"COMPLETAMENTE NUEVO y tu misión es que agende su primera asesoría GRATUITA.\n\n"
+                f"REGLAS:\n"
+                f"- Responde amablemente a sus preguntas\n"
+                f"- DESPUÉS de cada respuesta, pregunta sobre agendar\n"
+                f"- Enfoca los beneficios en la asesoría GRATUITA\n"
+                f"- Si dice NO, respeta pero insiste gentilmente\n\n"
+                f"INFORMACIÓN DE LA EMPRESA:\n{contexto_completo}"
+            )
+        else:
+            prompt_sistema = (
+                f"Eres un asistente de {EMPRESA_CONFIG['nombre']} hablando con {nombre_usuario}, "
+                f"un cliente registrado.\n\n"
+                f"OBJETIVOS:\n"
+                f"- Brindar excelente soporte\n"
+                f"- Resolver dudas técnicas\n"
+                f"- Ser cálido y profesional\n"
+                f"- Solo agendar si él lo solicita expresamente\n\n"
+                f"INFORMACIÓN DE LA EMPRESA:\n{contexto_completo}"
+            )
+        
+        # Generar respuesta con OpenAI
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": prompt_sistema},
+                {"role": "user", "content": mensaje}
+            ],
+            temperature=0.7,
+            max_tokens=300  # Limitado para WhatsApp
+        )
+        
+        respuesta_ia = response.choices[0].message.content
+        
+        # Para usuarios nuevos, agregar pregunta de agendamiento si no la incluye
+        if es_nuevo and not sesion.es_segunda_oportunidad:
+            palabras_agendamiento = ['agendar', 'cita', 'asesoría', 'reunión', 'consulta', 'gratuita']
+            if not any(palabra in respuesta_ia.lower() for palabra in palabras_agendamiento):
+                import random
+                preguntas = [
+                    "\n\n¿Te gustaría agendar tu asesoría gratuita para analizar tu caso específico?",
+                    "\n\n¿Cuándo podrías tener 30 minutos para una consulta gratuita personalizada?",
+                    "\n\n¿Te interesa programar una reunión sin costo para revisar tu situación?"
+                ]
+                respuesta_ia += random.choice(preguntas)
+        
+        return respuesta_ia
+    
+    except Exception as e:
+        logger.error(f"Error generando respuesta IA: {str(e)}")
+        return ("Disculpa, tuve un problema técnico. ¿Puedes repetir tu pregunta? "
+               f"También puedes contactarnos en {EMPRESA_CONFIG['telefono_soporte']}")
+
+# Rutas de Flask para WhatsApp Webhook
+@app.route('/webhook', methods=['GET'])
+def verify_webhook():
+    """Verificación del webhook de WhatsApp"""
+    mode = request.args.get('hub.mode')
+    token = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
+    
+    if mode == 'subscribe' and token == WHATSAPP_VERIFY_TOKEN:
+        logger.info("Webhook verificado exitosamente")
+        return challenge
+    else:
+        logger.warning("Fallo en verificación de webhook")
+        return 'Forbidden', 403
+
+@app.route('/webhook', methods=['POST'])
+def handle_webhook():
+    """Maneja mensajes entrantes de WhatsApp"""
+    try:
+        data = request.get_json()
+        
+        # Verificar estructura del mensaje
+        if (data.get('object') and 
+            data.get('entry') and 
+            data['entry'][0].get('changes') and
+            data['entry'][0]['changes'][0].get('value') and
+            data['entry'][0]['changes'][0]['value'].get('messages')):
+            
+            messages = data['entry'][0]['changes'][0]['value']['messages']
+            
+            for message in messages:
+                # Procesar solo mensajes de texto
+                if message.get('type') == 'text':
+                    telefono = message['from']
+                    texto = message['text']['body']
+                    
+                    logger.info(f"Mensaje recibido de {telefono}: {texto}")
+                    
+                    # Procesar mensaje y generar respuesta
+                    respuesta = procesar_mensaje_usuario(telefono, texto)
+                    
+                    # Enviar respuesta por WhatsApp
+                    if respuesta:
+                        enviar_mensaje_whatsapp(telefono, respuesta)
+                    
+        return jsonify({'status': 'success'}), 200
+        
+    except Exception as e:
+        logger.error(f"Error procesando webhook: {str(e)}")
+        return jsonify({'status': 'error'}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint para verificar estado del servicio"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'service': EMPRESA_CONFIG['nombre']
+    }), 200
+
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """Endpoint para estadísticas básicas"""
+    try:
+        sesiones_activas = len([s for s in sesiones_usuarios.values() if s.es_sesion_activa()])
+        return jsonify({
+            'sesiones_activas': sesiones_activas,
+            'total_sesiones': len(sesiones_usuarios),
+            'timestamp': datetime.now().isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"Error obteniendo estadísticas: {str(e)}")
+        return jsonify({'error': 'Error interno'}), 500
+
+# Función para limpiar sesiones antiguas (ejecutar periódicamente)
+def limpiar_sesiones_antiguas():
+    """Limpia sesiones inactivas para liberar memoria"""
+    try:
+        sesiones_a_eliminar = []
+        for telefono, sesion in sesiones_usuarios.items():
+            if not sesion.es_sesion_activa():
+                sesiones_a_eliminar.append(telefono)
+        
+        for telefono in sesiones_a_eliminar:
+            del sesiones_usuarios[telefono]
+        
+        if sesiones_a_eliminar:
+            logger.info(f"Eliminadas {len(sesiones_a_eliminar)} sesiones inactivas")
+            
+    except Exception as e:
+        logger.error(f"Error limpiando sesiones: {str(e)}")
+
+if __name__ == '__main__':
+    # CONFIGURACIÓN DE DESPLIEGUE
+    # DESARROLLO: Usar debug=True, port=5000
+    # PRODUCCIÓN: Usar debug=False, port=80 o el que asigne tu hosting
+    
+    port = int(os.environ.get('PORT', 5000))  # Para Heroku/Railway
+    app.run(host='0.0.0.0', port=port, debug=False)  # CAMBIAR: debug=False en producción
