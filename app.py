@@ -1,4 +1,4 @@
- app.py - Versión Mínima para WhatsApp Webhook
+# app.py - Versión Mínima para WhatsApp Webhook en Render
 import os
 from flask import Flask, request, jsonify
 from datetime import datetime
@@ -38,8 +38,6 @@ def handle_webhook():
         print(f"Mensaje recibido: {data}")
         
         # Por ahora solo registramos el mensaje
-        # Aquí puedes agregar la lógica del chatbot después
-        
         return jsonify({'status': 'success'}), 200
         
     except Exception as e:
