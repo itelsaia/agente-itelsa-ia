@@ -1,7 +1,8 @@
-# calendar_service.py - Versión Producción
+# calendar_service.py - Versión Render
 import os
 import datetime
 import logging
+import json
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -12,28 +13,56 @@ logger = logging.getLogger(__name__)
 # Cargar variables de entorno
 load_dotenv()
 
-# CONFIGURACIÓN - PERSONALIZAR AQUÍ
-CREDS_FILE = os.getenv("CREDS_FILE")
+# CONFIGURACIÓN
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 
-# CONFIGURACIÓN DE HORARIOS - PERSONALIZAR SEGÚN TU NEGOCIO
+# CONFIGURACIÓN DE HORARIOS
 HORARIO_INICIO = 8  # 8 AM
 HORARIO_FIN = 17    # 5 PM (última cita a las 4 PM)
 DURACION_CITA = 1   # 1 hora por cita
 DIAS_LABORABLES = [0, 1, 2, 3, 4]  # Lunes a Viernes (0=Lunes, 6=Domingo)
 
-if not CREDS_FILE or not GOOGLE_CALENDAR_ID:
-    raise ValueError("❌ CREDS_FILE y GOOGLE_CALENDAR_ID deben estar configurados en .env")
+def setup_google_credentials():
+    """Configura las credenciales de Google para Render"""
+    try:
+        # Opción 1: JSON completo como variable de entorno
+        google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if google_creds_json:
+            creds_dict = json.loads(google_creds_json)
+        else:
+            # Opción 2: Variables individuales
+            creds_dict = {
+                "type": "service_account",
+                "project_id": os.getenv("GOOGLE_PROJECT_ID", "itelsa-chatbot-457800"),
+                "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID", "5e24805be5c74c038355e3d9b337bee4adc81b2c"),
+                "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace('\\n', '\n'),
+                "client_email": os.getenv("GOOGLE_CLIENT_EMAIL", "itelsa-chatbot@itelsa-chatbot-457800.iam.gserviceaccount.com"),
+                "client_id": os.getenv("GOOGLE_CLIENT_ID", "105596722046990867098"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL", "https://www.googleapis.com/robot/v1/metadata/x509/itelsa-chatbot%40itelsa-chatbot-457800.iam.gserviceaccount.com"),
+                "universe_domain": "googleapis.com"
+            }
+        
+        # Crear credenciales desde el diccionario
+        SCOPE = ["https://www.googleapis.com/auth/calendar"]
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
+        service = build("calendar", "v3", credentials=credentials)
+        
+        logger.info("✅ Conexión con Google Calendar establecida")
+        return service
+        
+    except Exception as e:
+        logger.error(f"❌ Error conectando con Google Calendar: {str(e)}")
+        raise
 
-# Configurar servicios de Google
+# Inicializar servicio
 try:
-    SCOPE = ["https://www.googleapis.com/auth/calendar"]
-    credentials = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPE)
-    service = build("calendar", "v3", credentials=credentials)
-    logger.info("✅ Conexión con Google Calendar establecida")
+    service = setup_google_credentials()
 except Exception as e:
-    logger.error(f"❌ Error conectando con Google Calendar: {str(e)}")
-    raise
+    logger.error(f"Error inicializando Google Calendar: {e}")
+    service = None
 
 def convertir_hora_a_24h(hora_texto):
     """
@@ -83,12 +112,16 @@ def generar_horarios_disponibles(fecha):
     Returns:
         list: Lista de horarios disponibles en formato amigable
     """
+    if not service:
+        logger.error("❌ Servicio de Google Calendar no disponible")
+        return []
+    
     horarios_disponibles = []
     
     try:
-        # PERSONALIZAR: Ajustar horarios según tu negocio
+        # Horarios base
         horarios_base = [
-            "8:00am", "9:00am", "10:00am", "11:00am", 
+            "8:00am", "9:00am", "10:00am", "11:00am",
             "12:00pm", "1:00pm", "2:00pm", "3:00pm", "4:00pm"
         ]
         
@@ -119,6 +152,9 @@ def verificar_horario_libre(fecha, hora_24h):
     Returns:
         bool: True si está libre, False si está ocupado
     """
+    if not service:
+        return False
+    
     try:
         # Crear ventana de tiempo
         start_datetime = datetime.datetime.strptime(f"{fecha}T{hora_24h}:00", "%Y-%m-%dT%H:%M:%S")
@@ -127,7 +163,7 @@ def verificar_horario_libre(fecha, hora_24h):
         # Consultar eventos existentes
         eventos = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=start_datetime.isoformat() + "-05:00",  # PERSONALIZAR: Ajustar timezone
+            timeMin=start_datetime.isoformat() + "-05:00",  # Timezone Colombia
             timeMax=end_datetime.isoformat() + "-05:00",
             singleEvents=True,
             orderBy="startTime"
@@ -242,6 +278,13 @@ def agendar_en_calendar(nombre, correo, telefono, fecha, hora):
     Returns:
         dict: Resultado del agendamiento
     """
+    if not service:
+        return {
+            'disponible': False,
+            'motivo': 'error_servicio',
+            'horarios_alternativos': []
+        }
+    
     try:
         # Verificar disponibilidad primero
         resultado = verificar_disponibilidad(fecha, hora)
@@ -259,22 +302,22 @@ def agendar_en_calendar(nombre, correo, telefono, fecha, hora):
         fecha_inicio = f"{fecha}T{hora_24h}:00"
         fecha_fin = f"{fecha}T{hora_num + DURACION_CITA:02d}:{minutos}:00"
         
-        # PERSONALIZAR: Ajustar título y descripción del evento
+        # Crear evento
         evento = {
-            'summary': f"Asesoría - {nombre}",  # CAMBIAR: Personalizar título
+            'summary': f"Asesoría - {nombre}",
             'description': (
                 f"Cliente: {nombre}\n"
                 f"Correo: {correo}\n"
                 f"Teléfono: {telefono}\n"
-                f"Tipo: Asesoría gratuita"  # CAMBIAR: Personalizar descripción
+                f"Tipo: Asesoría gratuita"
             ),
             'start': {
                 'dateTime': fecha_inicio,
-                'timeZone': 'America/Bogota',  # PERSONALIZAR: Tu timezone
+                'timeZone': 'America/Bogota',
             },
             'end': {
                 'dateTime': fecha_fin,
-                'timeZone': 'America/Bogota',  # PERSONALIZAR: Tu timezone
+                'timeZone': 'America/Bogota',
             },
             'attendees': [
                 {'email': correo}
@@ -290,7 +333,7 @@ def agendar_en_calendar(nombre, correo, telefono, fecha, hora):
         
         # Crear el evento en el calendario
         evento_creado = service.events().insert(
-            calendarId=GOOGLE_CALENDAR_ID, 
+            calendarId=GOOGLE_CALENDAR_ID,
             body=evento,
             sendUpdates='all'  # Enviar invitaciones por email
         ).execute()
@@ -325,9 +368,8 @@ def formatear_fecha_amigable(fecha_str):
     try:
         fecha_obj = datetime.datetime.strptime(fecha_str, "%Y-%m-%d")
         
-        # PERSONALIZAR: Ajustar idioma según tu región
         dias_semana = [
-            'lunes', 'martes', 'miércoles', 'jueves', 
+            'lunes', 'martes', 'miércoles', 'jueves',
             'viernes', 'sábado', 'domingo'
         ]
         meses = [
@@ -344,145 +386,6 @@ def formatear_fecha_amigable(fecha_str):
         logger.error(f"❌ Error formateando fecha '{fecha_str}': {str(e)}")
         return fecha_str
 
-def obtener_citas_del_dia(fecha):
-    """
-    Obtiene todas las citas agendadas para un día específico.
-    
-    Args:
-        fecha (str): Fecha en formato YYYY-MM-DD
-    
-    Returns:
-        list: Lista de eventos del día
-    """
-    try:
-        # Definir ventana del día completo
-        start_datetime = datetime.datetime.strptime(f"{fecha}T00:00:00", "%Y-%m-%dT%H:%M:%S")
-        end_datetime = start_datetime + datetime.timedelta(days=1)
-        
-        # Consultar eventos
-        eventos = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=start_datetime.isoformat() + "-05:00",
-            timeMax=end_datetime.isoformat() + "-05:00",
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
-        
-        citas = []
-        for evento in eventos.get('items', []):
-            try:
-                cita_info = {
-                    'id': evento.get('id'),
-                    'titulo': evento.get('summary', 'Sin título'),
-                    'descripcion': evento.get('description', ''),
-                    'inicio': evento.get('start', {}).get('dateTime', ''),
-                    'fin': evento.get('end', {}).get('dateTime', ''),
-                    'asistentes': [att.get('email', '') for att in evento.get('attendees', [])]
-                }
-                citas.append(cita_info)
-            except:
-                continue
-        
-        logger.info(f"📅 {len(citas)} citas encontradas para {fecha}")
-        return citas
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo citas del día {fecha}: {str(e)}")
-        return []
-
-def cancelar_cita(evento_id, motivo="Cancelada por el usuario"):
-    """
-    Cancela una cita específica en el calendario.
-    
-    Args:
-        evento_id (str): ID del evento a cancelar
-        motivo (str): Motivo de la cancelación
-    
-    Returns:
-        bool: True si se canceló exitosamente
-    """
-    try:
-        # Obtener el evento
-        evento = service.events().get(
-            calendarId=GOOGLE_CALENDAR_ID,
-            eventId=evento_id
-        ).execute()
-        
-        # Actualizar el evento para marcarlo como cancelado
-        evento['summary'] = f"[CANCELADA] {evento.get('summary', '')}"
-        evento['description'] = f"{evento.get('description', '')}\n\nCANCELADA: {motivo}"
-        evento['status'] = 'cancelled'
-        
-        # Actualizar en el calendario
-        service.events().update(
-            calendarId=GOOGLE_CALENDAR_ID,
-            eventId=evento_id,
-            body=evento,
-            sendUpdates='all'
-        ).execute()
-        
-        logger.info(f"✅ Cita cancelada exitosamente: {evento_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Error cancelando cita {evento_id}: {str(e)}")
-        return False
-
-def obtener_estadisticas_calendario(dias=7):
-    """
-    Obtiene estadísticas del calendario para los próximos N días.
-    
-    Args:
-        dias (int): Número de días a analizar
-    
-    Returns:
-        dict: Estadísticas del calendario
-    """
-    try:
-        # Definir ventana de tiempo
-        ahora = datetime.datetime.now()
-        fin_periodo = ahora + datetime.timedelta(days=dias)
-        
-        # Consultar eventos
-        eventos = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=ahora.isoformat() + "-05:00",
-            timeMax=fin_periodo.isoformat() + "-05:00",
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
-        
-        items = eventos.get('items', [])
-        
-        # Calcular estadísticas
-        total_citas = len(items)
-        citas_por_dia = {}
-        
-        for evento in items:
-            try:
-                inicio = evento.get('start', {}).get('dateTime', '')
-                if inicio:
-                    fecha = inicio.split('T')[0]
-                    citas_por_dia[fecha] = citas_por_dia.get(fecha, 0) + 1
-            except:
-                continue
-        
-        estadisticas = {
-            'total_citas_proximos_dias': total_citas,
-            'dias_analizados': dias,
-            'citas_por_dia': citas_por_dia,
-            'promedio_citas_dia': round(total_citas / dias, 2) if dias > 0 else 0,
-            'dia_mas_ocupado': max(citas_por_dia.items(), key=lambda x: x[1]) if citas_por_dia else None,
-            'timestamp_consulta': ahora.strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        logger.info(f"📊 Estadísticas generadas: {total_citas} citas en {dias} días")
-        return estadisticas
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo estadísticas: {str(e)}")
-        return None
-
 def verificar_conexion_calendar():
     """
     Verifica que la conexión con Google Calendar funcione correctamente.
@@ -490,6 +393,9 @@ def verificar_conexion_calendar():
     Returns:
         bool: True si la conexión es exitosa
     """
+    if not service:
+        return False
+    
     try:
         # Intentar obtener información del calendario
         calendar = service.calendars().get(calendarId=GOOGLE_CALENDAR_ID).execute()
@@ -500,55 +406,6 @@ def verificar_conexion_calendar():
         logger.error(f"❌ Error verificando conexión: {str(e)}")
         return False
 
-def inicializar_calendar_service():
-    """
-    Inicializa el servicio de calendario y verifica configuración.
-    
-    Returns:
-        bool: True si la inicialización es exitosa
-    """
-    try:
-        # Verificar conexión
-        if not verificar_conexion_calendar():
-            return False
-        
-        # Obtener estadísticas iniciales
-        stats = obtener_estadisticas_calendario(7)
-        if stats:
-            logger.info(f"📊 Estadísticas: {stats['total_citas_proximos_dias']} citas próximos 7 días")
-        
-        logger.info("✅ Servicio de calendario inicializado correctamente")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Error inicializando servicio: {str(e)}")
-        return False
-
-if __name__ == "__main__":
-    # Pruebas de funcionamiento
-    print("📅 Módulo Google Calendar - Versión Producción")
-    print("=" * 50)
-    
-    if inicializar_calendar_service():
-        print("✅ Servicio inicializado exitosamente")
-        
-        # Mostrar estadísticas
-        stats = obtener_estadisticas_calendario(7)
-        if stats:
-            print(f"\n📊 ESTADÍSTICAS (próximos 7 días):")
-            print(f"   Total citas: {stats['total_citas_proximos_dias']}")
-            print(f"   Promedio por día: {stats['promedio_citas_dia']}")
-            if stats['dia_mas_ocupado']:
-                fecha, cantidad = stats['dia_mas_ocupado']
-                print(f"   Día más ocupado: {formatear_fecha_amigable(fecha)} ({cantidad} citas)")
-        
-        # Probar horarios disponibles para mañana
-        mañana = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        horarios = generar_horarios_disponibles(mañana)
-        print(f"\n🕐 Horarios disponibles para {formatear_fecha_amigable(mañana)}:")
-        for i, horario in enumerate(horarios[:5], 1):  # Mostrar solo los primeros 5
-            print(f"   {i}. {horario}")
-        
-    else:
-        print("❌ Error en la inicialización")
-        print("Verifica tu configuración en el archivo .env")
+# Verificar conexión al importar
+if service and not verificar_conexion_calendar():
+    logger.warning("⚠️ Advertencia: Problemas con la conexión a Google Calendar")

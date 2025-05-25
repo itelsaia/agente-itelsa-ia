@@ -1,7 +1,8 @@
-# guardar_datos_google_sheets.py - Versión Producción
+# guardar_datos_google_sheets.py - Versión Render
 import os
 import datetime
 import logging
+import json
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
@@ -12,26 +13,54 @@ logger = logging.getLogger(__name__)
 # Cargar variables desde .env
 load_dotenv()
 
-# CONFIGURACIÓN - PERSONALIZAR AQUÍ
-CREDS_FILE = os.getenv("CREDS_FILE")  # Ruta al archivo JSON de credenciales
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # ID de tu Google Sheet
-SHEET_NAME = os.getenv("SHEET_NAME", "bd")  # Nombre de la hoja principal
+# CONFIGURACIÓN
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+SHEET_NAME = os.getenv("SHEET_NAME", "bd")
 
-if not CREDS_FILE:
-    raise ValueError("❌ CREDS_FILE no configurado en .env")
 if not SPREADSHEET_ID:
-    raise ValueError("❌ SPREADSHEET_ID no configurado en .env")
+    raise ValueError("❌ SPREADSHEET_ID no configurado en variables de entorno")
 
-# Autenticación con Google Sheets
-SCOPE = ['https://www.googleapis.com/auth/spreadsheets']
+def setup_google_sheets_credentials():
+    """Configura las credenciales de Google Sheets para Render"""
+    try:
+        # Opción 1: JSON completo como variable de entorno
+        google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if google_creds_json:
+            creds_dict = json.loads(google_creds_json)
+        else:
+            # Opción 2: Variables individuales
+            creds_dict = {
+                "type": "service_account",
+                "project_id": os.getenv("GOOGLE_PROJECT_ID", "itelsa-chatbot-457800"),
+                "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID", "5e24805be5c74c038355e3d9b337bee4adc81b2c"),
+                "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace('\\n', '\n'),
+                "client_email": os.getenv("GOOGLE_CLIENT_EMAIL", "itelsa-chatbot@itelsa-chatbot-457800.iam.gserviceaccount.com"),
+                "client_id": os.getenv("GOOGLE_CLIENT_ID", "105596722046990867098"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL", "https://www.googleapis.com/robot/v1/metadata/x509/itelsa-chatbot%40itelsa-chatbot-457800.iam.gserviceaccount.com"),
+                "universe_domain": "googleapis.com"
+            }
+        
+        # Crear credenciales desde el diccionario
+        SCOPE = ['https://www.googleapis.com/auth/spreadsheets']
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
+        client = gspread.authorize(credentials)
+        
+        logger.info("✅ Conexión con Google Sheets establecida")
+        return client
+        
+    except Exception as e:
+        logger.error(f"❌ Error conectando con Google Sheets: {str(e)}")
+        raise
 
+# Inicializar cliente
 try:
-    credentials = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPE)
-    client = gspread.authorize(credentials)
-    logger.info("✅ Conexión con Google Sheets establecida")
+    client = setup_google_sheets_credentials()
 except Exception as e:
-    logger.error(f"❌ Error conectando con Google Sheets: {str(e)}")
-    raise
+    logger.error(f"Error inicializando Google Sheets: {e}")
+    client = None
 
 def guardar_datos(nombre_completo, correo, telefono, servicio_interesado, comentario_mensaje):
     """
@@ -47,6 +76,10 @@ def guardar_datos(nombre_completo, correo, telefono, servicio_interesado, coment
     Returns:
         bool: True si se guardó exitosamente, False en caso contrario
     """
+    if not client:
+        logger.error("❌ Cliente de Google Sheets no disponible")
+        return False
+    
     try:
         # Conectar con la hoja
         sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
@@ -54,8 +87,7 @@ def guardar_datos(nombre_completo, correo, telefono, servicio_interesado, coment
         # Crear timestamp actual
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # PERSONALIZAR: Ajustar según tu estructura de columnas
-        # Estructura actual: [Timestamp, Nombre, Correo, Telefono, Servicio, Comentario]
+        # Estructura: [Timestamp, Nombre, Correo, Telefono, Servicio, Comentario]
         nueva_fila = [
             timestamp,              # A: Timestamp
             nombre_completo,        # B: Nombre Completo
@@ -85,20 +117,34 @@ def verificar_usuario(correo):
     Returns:
         str: Nombre del usuario si existe, None si no existe
     """
+    if not client:
+        logger.error("❌ Cliente de Google Sheets no disponible")
+        return None
+    
     try:
         sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
         registros = sheet.get_all_records()
         correo_input = correo.strip().lower()
-
+        
         for fila in registros:
-            # PERSONALIZAR: Ajustar nombre de columna según tu hoja
-            correo_bd = str(fila.get("Indícanos tu Correo Electrónico", "")).strip().lower()
+            # Buscar en diferentes posibles nombres de columna
+            correo_bd = ""
+            for key in fila.keys():
+                if 'correo' in key.lower() or 'email' in key.lower():
+                    correo_bd = str(fila.get(key, "")).strip().lower()
+                    break
             
             if correo_input == correo_bd:
-                nombre_encontrado = fila.get("Nombre Completo", "")
+                # Buscar nombre en diferentes posibles nombres de columna
+                nombre_encontrado = ""
+                for key in fila.keys():
+                    if 'nombre' in key.lower():
+                        nombre_encontrado = fila.get(key, "")
+                        break
+                
                 logger.info(f"✅ Usuario encontrado: {nombre_encontrado}")
                 return nombre_encontrado
-
+        
         logger.info(f"ℹ️ Usuario nuevo: {correo}")
         return None
         
@@ -116,24 +162,47 @@ def obtener_datos_usuario_completos(correo):
     Returns:
         dict: Datos completos del usuario o None si no existe
     """
+    if not client:
+        logger.error("❌ Cliente de Google Sheets no disponible")
+        return None
+    
     try:
         sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
         registros = sheet.get_all_records()
         correo_input = correo.strip().lower()
-
+        
         for fila in registros:
-            correo_bd = str(fila.get("Indícanos tu Correo Electrónico", "")).strip().lower()
+            # Buscar correo en diferentes posibles nombres de columna
+            correo_bd = ""
+            for key in fila.keys():
+                if 'correo' in key.lower() or 'email' in key.lower():
+                    correo_bd = str(fila.get(key, "")).strip().lower()
+                    break
             
             if correo_input == correo_bd:
-                # PERSONALIZAR: Ajustar nombres de columnas según tu estructura
+                # Extraer datos usando patrones flexibles
                 datos_usuario = {
-                    'nombre_completo': fila.get("Nombre Completo", ""),
-                    'correo': fila.get("Indícanos tu Correo Electrónico", ""),
-                    'telefono': fila.get("Indícanos por favor tu numero de contacto", ""),
-                    'servicio_interesado': fila.get("Por favor indícanos en que servicio estas interesado/a", ""),
-                    'comentario': fila.get("Comentario o Mensaje", ""),
-                    'timestamp_registro': fila.get("Timestamp", "")
+                    'nombre_completo': "",
+                    'correo': correo,
+                    'telefono': "",
+                    'servicio_interesado': "",
+                    'comentario': "",
+                    'timestamp_registro': ""
                 }
+                
+                # Mapear campos de forma flexible
+                for key, value in fila.items():
+                    key_lower = key.lower()
+                    if 'nombre' in key_lower:
+                        datos_usuario['nombre_completo'] = str(value)
+                    elif 'telefono' in key_lower or 'contacto' in key_lower:
+                        datos_usuario['telefono'] = str(value)
+                    elif 'servicio' in key_lower or 'interesa' in key_lower:
+                        datos_usuario['servicio_interesado'] = str(value)
+                    elif 'comentario' in key_lower or 'mensaje' in key_lower:
+                        datos_usuario['comentario'] = str(value)
+                    elif 'timestamp' in key_lower or 'fecha' in key_lower:
+                        datos_usuario['timestamp_registro'] = str(value)
                 
                 logger.info(f"✅ Datos encontrados para: {datos_usuario['nombre_completo']}")
                 return datos_usuario
@@ -152,6 +221,9 @@ def contar_usuarios_registrados():
     Returns:
         int: Número total de usuarios
     """
+    if not client:
+        return 0
+    
     try:
         sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
         registros = sheet.get_all_records()
@@ -164,99 +236,16 @@ def contar_usuarios_registrados():
         logger.error(f"❌ Error contando usuarios: {str(e)}")
         return 0
 
-def validar_estructura_bd():
+def verificar_conexion_sheets():
     """
-    Valida que la estructura de la base de datos sea correcta.
-    
-    Returns:
-        bool: True si la estructura es válida
-    """
-    try:
-        sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-        headers = sheet.row_values(1)
-        
-        # PERSONALIZAR: Definir headers esperados para tu caso
-        headers_esperados = [
-            "Timestamp",
-            "Nombre Completo", 
-            "Indícanos tu Correo Electrónico",
-            "Indícanos por favor tu numero de contacto",
-            "Por favor indícanos en que servicio estas interesado/a",
-            "Comentario o Mensaje"
-        ]
-        
-        estructura_valida = True
-        for i, header_esperado in enumerate(headers_esperados):
-            if i >= len(headers) or headers[i] != header_esperado:
-                logger.warning(f"⚠️ Header incorrecto en columna {i+1}: '{headers[i] if i < len(headers) else 'FALTANTE'}' (esperado: '{header_esperado}')")
-                estructura_valida = False
-        
-        if estructura_valida:
-            logger.info("✅ Estructura de BD válida")
-        else:
-            logger.error("❌ Estructura de BD inválida")
-            
-        return estructura_valida
-        
-    except Exception as e:
-        logger.error(f"❌ Error validando estructura: {str(e)}")
-        return False
-
-def obtener_estadisticas_bd():
-    """
-    Obtiene estadísticas básicas de la base de datos.
-    
-    Returns:
-        dict: Estadísticas de la base de datos
-    """
-    try:
-        sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-        registros = sheet.get_all_records()
-        
-        total_usuarios = len(registros)
-        
-        # Contar usuarios por servicio de interés
-        servicios = {}
-        for registro in registros:
-            servicio = registro.get("Por favor indícanos en que servicio estas interesado/a", "Sin especificar")
-            servicios[servicio] = servicios.get(servicio, 0) + 1
-        
-        # Registros recientes (últimos 7 días)
-        hace_7_dias = datetime.datetime.now() - datetime.timedelta(days=7)
-        registros_recientes = 0
-        
-        for registro in registros:
-            try:
-                timestamp_str = registro.get("Timestamp", "")
-                if timestamp_str:
-                    timestamp = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-                    if timestamp > hace_7_dias:
-                        registros_recientes += 1
-            except:
-                continue
-        
-        estadisticas = {
-            'total_usuarios': total_usuarios,
-            'registros_ultimos_7_dias': registros_recientes,
-            'servicios_de_interes': servicios,
-            'timestamp_consulta': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        logger.info(f"📊 Estadísticas generadas: {total_usuarios} usuarios total, {registros_recientes} recientes")
-        return estadisticas
-        
-    except Exception as e:
-        logger.error(f"❌ Error obteniendo estadísticas: {str(e)}")
-        return None
-
-# Función de inicialización para verificar conexión
-def inicializar_conexion():
-    """
-    Inicializa y verifica la conexión con Google Sheets.
+    Verifica que la conexión con Google Sheets funcione correctamente.
     
     Returns:
         bool: True si la conexión es exitosa
     """
+    if not client:
+        return False
+    
     try:
         # Verificar acceso a la hoja
         sheet = client.open_by_key(SPREADSHEET_ID)
@@ -266,35 +255,12 @@ def inicializar_conexion():
         worksheet = sheet.worksheet(SHEET_NAME)
         logger.info(f"✅ Hoja '{SHEET_NAME}' encontrada")
         
-        # Validar estructura
-        if validar_estructura_bd():
-            logger.info("✅ Inicialización de Google Sheets completa")
-            return True
-        else:
-            logger.warning("⚠️ Inicialización con advertencias de estructura")
-            return True  # Continuar aunque haya advertencias
-            
+        return True
+        
     except Exception as e:
-        logger.error(f"❌ Error en inicialización: {str(e)}")
+        logger.error(f"❌ Error verificando conexión: {str(e)}")
         return False
 
-if __name__ == "__main__":
-    # Pruebas de funcionamiento
-    print("🔧 Módulo Google Sheets - Versión Producción")
-    print("=" * 50)
-    
-    if inicializar_conexion():
-        print("✅ Conexión establecida exitosamente")
-        
-        # Mostrar estadísticas
-        stats = obtener_estadisticas_bd()
-        if stats:
-            print(f"\n📊 ESTADÍSTICAS:")
-            print(f"   Total usuarios: {stats['total_usuarios']}")
-            print(f"   Registros últimos 7 días: {stats['registros_ultimos_7_dias']}")
-            print(f"   Servicios más solicitados:")
-            for servicio, cantidad in sorted(stats['servicios_de_interes'].items(), key=lambda x: x[1], reverse=True)[:3]:
-                print(f"     - {servicio}: {cantidad}")
-    else:
-        print("❌ Error en la conexión")
-        print("Verifica tu configuración en el archivo .env")
+# Verificar conexión al importar
+if client and not verificar_conexion_sheets():
+    logger.warning("⚠️ Advertencia: Problemas con la conexión a Google Sheets")
